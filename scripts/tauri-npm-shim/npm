@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+
+const { spawnSync } = require("node:child_process");
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
+
+const args = process.argv.slice(2);
+const cwd = process.cwd();
+const realNpm = process.env.LIFEMIND_REAL_NPM || "/usr/local/bin/npm";
+
+function readInstalledVersion(packageName) {
+  const packageLock = JSON.parse(readFileSync(path.join(cwd, "package-lock.json"), "utf8"));
+  const packageJson = JSON.parse(readFileSync(path.join(cwd, "package.json"), "utf8"));
+  const locked = packageLock.packages?.[`node_modules/${packageName}`]?.version;
+  const declared =
+    packageJson.dependencies?.[packageName] ||
+    packageJson.devDependencies?.[packageName] ||
+    "0.0.0";
+
+  return locked || declared.replace(/^[^\d]*/, "");
+}
+
+function isInstalled(packageName) {
+  const packageLock = JSON.parse(readFileSync(path.join(cwd, "package-lock.json"), "utf8"));
+  return Boolean(packageLock.packages?.[`node_modules/${packageName}`]);
+}
+
+function printTauriPackageTree(packageNames) {
+  const dependencies = {};
+  const packageJson = JSON.parse(readFileSync(path.join(cwd, "package.json"), "utf8"));
+
+  for (const packageName of packageNames.filter(isInstalled)) {
+    dependencies[packageName] = {
+      version: readInstalledVersion(packageName),
+      resolved: path.join(cwd, "node_modules", packageName),
+    };
+  }
+
+  process.stdout.write(
+    `${JSON.stringify({
+      name: "lifemind",
+      version: packageJson.version || "0.1.0",
+      dependencies,
+    })}\n`,
+  );
+}
+
+const isTauriLs =
+  ["ls", "list"].includes(args[0]) &&
+  args.some((arg) => arg.startsWith("@tauri-apps/"));
+
+if (isTauriLs) {
+  printTauriPackageTree(args.filter((arg) => arg.startsWith("@tauri-apps/")));
+  process.exit(0);
+}
+
+const result = spawnSync(realNpm, args, {
+  stdio: "inherit",
+  env: {
+    ...process.env,
+    PATH: process.env.PATH?.split(":").filter((entry) => entry !== __dirname).join(":"),
+  },
+});
+
+process.exit(result.status ?? 1);
