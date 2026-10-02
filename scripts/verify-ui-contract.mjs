@@ -85,7 +85,11 @@ assert(
   "DeepSeek strict requests should use the beta chat completions endpoint",
 );
 assert(runner.includes('baseUrl: "https://api.deepseek.com"'), "DeepSeek preset should use the current API base URL");
+assert(runner.includes('model: "deepseek-flash"'), "DeepSeek preset should use the current Flash model");
 assert(page.includes("isLegacyDeepSeekModel"), "legacy DeepSeek model settings should migrate to V4");
+assert(page.includes('value === "deepseek-v4-flash"'), "old DeepSeek V4 Flash settings should migrate to Flash");
+assert(page.includes('value === "deepseek-v4-pro"'), "old DeepSeek V4 Pro settings should migrate to Flash");
+assert(page.includes("pdfQualitySampleCount"), "PDF quality samples should be counted for later threshold review");
 assert(tauri.version === pkg.version, "Tauri and frontend package versions should stay synchronized");
 assert(pkg.version === "0.2.4", "current patched build should be version 0.2.4");
 assert(pkg.scripts["desktop:dev"] === "tauri dev --no-watch", "desktop dev should disable the unstable Rust file watcher");
@@ -233,19 +237,14 @@ assert(
   rust.includes("api.deepseek.com/beta/chat/completions"),
   "Tauri strict model requests should normalize DeepSeek to the beta chat completions endpoint",
 );
-assert(rust.includes("is_deepseek_thinking_model"), "Tauri should identify DeepSeek V4 thinking models");
 assert(rust.includes("build_chat_completion_request"), "Tauri should isolate model request construction for regression testing");
-assert(rust.includes("let thinking_enabled"), "Tauri should derive thinking mode from the review pass");
-assert(rust.includes('serde_json::json!({ "type": if thinking_enabled { "enabled" } else { "disabled" } })'), "Tauri should use cheaper disabled thinking for the draft pass");
+assert(rust.includes('thinking: Some(serde_json::json!({ "type": "disabled" }))'), "Tauri should keep thinking disabled for stable review calls");
 assert(rust.includes("max_tokens"), "Tauri model requests should cap output tokens");
-assert(rust.includes("tool_choice: (!thinking_model)"), "DeepSeek V4 thinking requests must omit unsupported tool_choice");
-assert(runner.includes("isDeepSeekThinkingModel"), "browser fallback should identify DeepSeek V4 thinking models");
-assert(runner.includes("thinking: { type: thinkingEnabled ? \"enabled\" : \"disabled\" }"), "browser fallback should vary thinking by review pass");
+assert(runner.includes('thinking: { type: "disabled" }'), "browser fallback should keep thinking disabled for stable review calls");
 assert(runner.includes("max_tokens: maxOutputTokens"), "browser fallback should cap output tokens");
 assert(runner.includes("prompt_cache_hit_tokens"), "browser fallback should parse prompt cache usage");
 assert(runner.includes("reasoningTokens"), "browser fallback should expose reasoning token usage");
 assert(runner.includes("summarizeReviewUsage"), "review runner should aggregate usage across retries and quality passes");
-assert(runner.includes('reasoning_effort: reasoningEffort'), "browser fallback should pass the selected DeepSeek V4 reasoning effort");
 assert(runner.includes("temperature: 0"), "legacy DeepSeek requests should retain deterministic temperature");
 assert(runner.includes("tool_choice"), "legacy DeepSeek requests should retain fixed tool choice compatibility");
 assert(cargoToml.includes('"system-proxy"'), "Tauri reqwest client should include system proxy support for model API calls");

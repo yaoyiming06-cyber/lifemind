@@ -26,6 +26,7 @@ import { motion, AnimatePresence } from "@/lib/simple-motion";
 import {
   buildBatchPreviewRoot,
   buildPreviewFiles,
+  buildPdfAssetPreviewFiles,
   buildVaultMoveFiles,
   buildVaultWriteFiles,
   preparePdfExtractedContent,
@@ -82,6 +83,8 @@ const reviewProviderStorageKey = "lifemind.reviewProvider";
 const modelBaseUrlStorageKey = "lifemind.modelBaseUrl";
 const modelNameStorageKey = "lifemind.modelName";
 const modelFallbackStorageKey = "lifemind.modelFallbackToLocal";
+const pdfQualitySampleCountStorageKey = "lifemind.pdfQualitySampleCount";
+const pdfQualityThresholdReminder = 10;
 
 type TransactionState = "idle" | "writing" | "written" | "undoing" | "undone" | "failed";
 type ReviewRunState = "idle" | "reviewing" | "failed";
@@ -154,6 +157,9 @@ type ExtractedContent = {
   title: string;
   content: string;
   sourceType: IntakeSourceType;
+  pdfEvidence?: IntakeSource["pdfEvidence"];
+  pdfQualitySource?: string;
+  pdfTextLayerLowQuality?: boolean;
 };
 
 type PendingFileItem = {
@@ -678,7 +684,22 @@ export default function Home() {
     if (readableSources.length === 0) {
       setReviewRunState("failed");
       setReviewEngineMessage("");
-      setIntakeError("没有可审理的文本内容。当前支持文本、Markdown、代码、文本型 PDF 和静态网页；截图 OCR 稍后接入。");
+      setIntakeError("没有可审理内容。请提供可提取的文本，或确保 PDF 页面能够成功渲染为图像。");
+      return false;
+    }
+
+    const blockedPdfSources = readableSources.filter((source) => source.pdfQuality?.qualityStatus === "blocked");
+
+    const unreviewableBlockedPdfs = blockedPdfSources.filter(
+      (source) => !source.pdfEvidence?.pages.some((page) => page.imageReviewRequired && page.imageDataUrl),
+    );
+
+    if (unreviewableBlockedPdfs.length > 0) {
+      setReviewRunState("failed");
+      setReviewEngineMessage("");
+      setIntakeError(
+        `以下 PDF 的困难文字超过 50%，且没有可复核的原始页图像，已停止审理：${unreviewableBlockedPdfs.map((source) => source.title).join("、")}。请补充清晰材料或人工转录。`,
+      );
       return false;
     }
 
@@ -724,7 +745,17 @@ export default function Home() {
       setWritePlan(null);
       await waitForMinimumLoading(loadingStartedAt);
       setReviewRunState("idle");
-      setReviewEngineMessage(vaultKnowledge.message ? `${result.message} ${vaultKnowledge.message}` : result.message);
+      const pdfQualityMessage = readableSources
+        .filter((source) => source.pdfQuality && source.pdfQuality.qualityStatus !== "normal")
+        .map(
+          (source) =>
+            `PDF“${source.title}”困难文字约 ${Math.round((source.pdfQuality?.difficultyRatio ?? 0) * 100)}%，结果需按${source.pdfQuality?.qualityStatus === "partial" ? "部分审理" : "风险提示"}复核。`,
+        )
+        .join(" ");
+      const pdfQualityReminder = recordPdfQualitySamples(readableSources);
+      setReviewEngineMessage(
+        [result.message, vaultKnowledge.message, pdfQualityMessage, pdfQualityReminder].filter(Boolean).join(" "),
+      );
       setActiveNav("审理");
       setActiveTab("AI 结果");
 
@@ -1405,7 +1436,12 @@ export default function Home() {
           vault: previewVault.name,
           file: previewVault.indexFile,
           previewRoot: buildBatchPreviewRoot(previewVault.root, reviewBatch.id),
-          files: activePreviewFiles,
+          files: [
+            ...activePreviewFiles
+              .filter((previewFile) => !previewFile.path.startsWith("附件/PDF页面/"))
+              .map((previewFile) => ({ ...previewFile, binary: false })),
+            ...buildPdfAssetPreviewFiles(reviewBatch).map((asset) => ({ ...asset, binary: true })),
+          ],
         });
       }
       if (previewRequestRef.current !== previewRequestId) return;
@@ -2230,15 +2266,35 @@ async function extractPathSource(path: string, index: number, stackHint: string)
   const command = type === "pdf" ? "extract_pdf_text_from_path" : "extract_text_file_from_path";
   const extracted = await invoke<ExtractedContent>(command, { path });
   const title = extracted.title || stripExtension(fileName);
-  const content =
-    extracted.sourceType === "pdf" ? preparePdfExtractedContent(title, extracted.content).content : extracted.content;
+  const prepared = extracted.sourceType === "pdf"
+    ? preparePdfExtractedContent(
+        title,
+        extracted.content,
+        extracted.pdfEvidence,
+        extracted.pdfQualitySource,
+        extracted.pdfTextLayerLowQuality,
+      )
+    : null;
+  const content = prepared?.content ?? extracted.content;
+  const sourceId = `file-${index + 1}-${safeSourceId(fileName)}`;
+  const pdfEvidence = extracted.pdfEvidence
+    ? {
+        ...extracted.pdfEvidence,
+        images: (extracted.pdfEvidence.images ?? []).map((image, imageIndex) => ({
+          ...image,
+          assetId: `pdf-image-${safeSourceId(sourceId)}-page-${image.page}-${imageIndex + 1}`,
+        })),
+      }
+    : undefined;
 
   return {
-    id: `file-${index + 1}-${safeSourceId(fileName)}`,
+    id: sourceId,
     title,
     type: extracted.sourceType,
     stackHint,
     content,
+    ...(prepared ? { pdfQuality: prepared.quality } : {}),
+    ...(pdfEvidence ? { pdfEvidence } : {}),
   };
 }
 
@@ -2315,6 +2371,25 @@ function formatByteSize(size: number) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function recordPdfQualitySamples(sources: IntakeSource[]) {
+  if (typeof window === "undefined") return "";
+
+  const sampleCount = sources.filter((source) => source.type === "pdf" && source.pdfQuality).length;
+
+  if (sampleCount === 0) return "";
+
+  const previousCount = Number.parseInt(window.localStorage.getItem(pdfQualitySampleCountStorageKey) ?? "0", 10);
+  const normalizedPreviousCount = Number.isFinite(previousCount) && previousCount >= 0 ? previousCount : 0;
+  const nextCount = normalizedPreviousCount + sampleCount;
+  window.localStorage.setItem(pdfQualitySampleCountStorageKey, String(nextCount));
+
+  if (normalizedPreviousCount < pdfQualityThresholdReminder && nextCount >= pdfQualityThresholdReminder) {
+    return `已累计 ${nextCount} 份 PDF 质量样本，后续可根据实测结果重新评估质量阀门。`;
+  }
+
+  return "";
+}
+
 function readStoredReviewProvider(value: string | null): ReviewSkillProvider {
   // 旧版本保存过的供应商全部迁移到当前唯一外部模型。
   void value;
@@ -2323,7 +2398,7 @@ function readStoredReviewProvider(value: string | null): ReviewSkillProvider {
 
 function getDefaultDeepSeekSetting(key: "baseUrl" | "model") {
   const preset = reviewModelProviderPresets[0];
-  return key === "baseUrl" ? preset?.baseUrl ?? "https://api.deepseek.com" : preset?.model ?? "deepseek-v4-pro";
+  return key === "baseUrl" ? preset?.baseUrl ?? "https://api.deepseek.com" : preset?.model ?? "deepseek-flash";
 }
 
 function readStoredDeepSeekSetting(
@@ -2339,7 +2414,13 @@ function readStoredDeepSeekSetting(
 }
 
 function isLegacyDeepSeekModel(value: string | null) {
-  return value === "deepseek-chat" || value === "deepseek-reasoner";
+  return (
+    value === "deepseek-chat" ||
+    value === "deepseek-reasoner" ||
+    value === "deepseek-v4-pro" ||
+    value === "deepseek-v4-flash" ||
+    value === "deepseek-v4-flash-vision-exp"
+  );
 }
 
 function getReviewProviderLabel(provider: ReviewSkillProvider) {
@@ -2905,7 +2986,7 @@ function SettingsWorkspace({
               <input
                 value={modelName}
                 onChange={(event) => onModelNameChange(event.target.value)}
-                placeholder="deepseek-v4-pro"
+                placeholder="deepseek-flash"
                 aria-label="模型名称"
               />
               <input

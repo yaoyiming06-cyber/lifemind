@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  deepSeekReviewTool,
   estimateDeepSeekCost,
+  reviewModelProviderPresets,
   runReviewSkill,
   summarizeReviewUsage,
   type OpenAICompatibleModelRequest,
   type ReviewModelUsage,
 } from "./lifemind-review-runner";
+import type { IntakeSource } from "./lifemind-core";
 
 const source = {
   id: "cost-test-source",
@@ -15,9 +18,30 @@ const source = {
   content: "Git 用于版本管理，分支用于隔离功能开发，提交用于保存阶段性成果。",
 };
 
-function createPlan() {
+describe("DeepSeek model defaults", () => {
+  it("uses the current DeepSeek Flash model name", () => {
+    expect(reviewModelProviderPresets[0]?.model).toBe("deepseek-flash");
+  });
+});
+
+function createPlan(sourceOverride: { id: string; type: "text" | "pdf" } = source) {
+  const pageCoverage =
+    sourceOverride.type === "pdf"
+      ? [
+          {
+            sourceId: sourceOverride.id,
+            page: 2,
+            status: "covered",
+            sectionIds: [],
+            evidenceIds: ["pdf-page-2-text-1"],
+            summary: "第 2 页页面图像已发送并完成覆盖审理。",
+          },
+        ]
+      : [];
+
   return {
     protocolVersion: "lifemind.review.v2",
+    pageCoverage,
     stackDecisions: [
       {
         sourceId: source.id,
@@ -47,7 +71,11 @@ function createPlan() {
   };
 }
 
-function responseFor(usage: Record<string, unknown>) {
+function responseFor(
+  usage: Record<string, unknown>,
+  sourceOverride?: { id: string; type: "text" | "pdf" },
+  planOverride?: unknown,
+) {
   return new Response(
     JSON.stringify({
       choices: [
@@ -59,7 +87,7 @@ function responseFor(usage: Record<string, unknown>) {
                 type: "function",
                 function: {
                   name: "submit_review_plan",
-                  arguments: JSON.stringify(createPlan()),
+                  arguments: JSON.stringify(planOverride ?? createPlan(sourceOverride)),
                 },
               },
             ],
@@ -73,6 +101,189 @@ function responseFor(usage: Record<string, unknown>) {
 }
 
 describe("review usage accounting", () => {
+  it("accepts model placements for extracted PDF images and writes only that image", async () => {
+    const source: IntakeSource = {
+      id: "pdf-image-source",
+      title: "信号处理讲义",
+      type: "pdf",
+      stackHint: "信号处理",
+      content: "PDF 页面视觉证据",
+      pdfEvidence: {
+        pages: [{
+          page: 1,
+          imageWidth: 1200,
+          imageHeight: 1600,
+          imageReviewRequired: true,
+          imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+          evidence: [],
+        }],
+        images: [{
+          assetId: "pdf-image-pdf-image-source-page-1-1",
+          page: 1,
+          imageWidth: 320,
+          imageHeight: 180,
+          x: 0.125,
+          y: 0.25,
+          width: 0.5,
+          height: 0.25,
+          imageDataUrl: "data:image/png;base64,aW1hZ2U=",
+        }],
+      },
+    };
+    const plan = {
+      protocolVersion: "lifemind.review.v2",
+      pageCoverage: [{
+        sourceId: source.id,
+        page: 1,
+        status: "covered",
+        sectionIds: ["filter-response"],
+        evidenceIds: [],
+        summary: "第 1 页已审理。",
+      }],
+      stackDecisions: [{ sourceId: source.id, name: "信号处理", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: [{
+        id: "filter-response",
+        sourceId: source.id,
+        title: "滤波器响应",
+        role: "基本原理",
+        grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: "滤波器响应", targetNodeId: null },
+        parentId: null,
+        status: "新建笔记",
+        existingNoteTitle: null,
+        body: "频率响应如下图所示。",
+        formulas: [],
+        imagePlacements: [{
+          assetId: "pdf-image-pdf-image-source-page-1-1",
+          sourcePage: 1,
+          placement: "after-section",
+          anchor: null,
+          caption: "频率响应曲线",
+          alt: "滤波器频率响应",
+          confidence: "高",
+        }],
+        evidence: ["第 1 页图表"],
+      }],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    };
+
+    const result = await runReviewSkill([source], {
+      provider: "deepseek",
+      baseUrl: "https://api.example.test",
+      apiKey: "redacted-test-key",
+      model: "deepseek-flash",
+      fallbackToLocal: false,
+      modelInvoker: async () => JSON.stringify(plan),
+    });
+
+    expect(result.request.pdfEvidenceImages?.map((image) => image.kind)).toEqual(["page", "embedded"]);
+    expect(result.batch.notes[0]?.markdown).toContain("![[附件/PDF图片/pdf-image-pdf-image-source-page-1-1.png]]");
+    expect(result.batch.notes[0]?.markdown).not.toContain("附件/PDF页面");
+  });
+
+  it("sends PDF pages as image blocks without forwarding OCR text as model evidence", async () => {
+    let requestBody: Record<string, unknown> | null = null;
+    let requestCount = 0;
+    const pdfSource = {
+      ...source,
+      type: "pdf" as const,
+      pdfEvidence: {
+        pages: [
+          {
+            page: 2,
+            imageWidth: 1600,
+            imageHeight: 2200,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [
+              {
+                id: "pdf-page-2-ocr-1",
+                text: "E=mc^2",
+                source: "vision-ocr",
+                x: 0.1,
+                y: 0.2,
+                width: 0.3,
+                height: 0.05,
+                confidence: 0.42,
+                candidates: ["E=mc²"],
+              },
+              {
+                id: "pdf-page-2-text-1",
+                text: "第 2 页",
+                source: "pdf-text",
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                confidence: 1,
+                candidates: [],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const pdfPlan = createPlan(pdfSource);
+    pdfPlan.pageCoverage[0]!.evidenceIds = ["pdf-page-cost-test-source-page-2"];
+
+    await runReviewSkill([pdfSource], {
+      provider: "deepseek",
+      baseUrl: "https://api.example.test",
+      apiKey: "redacted-test-key",
+      model: "deepseek-flash",
+      fallbackToLocal: false,
+      fetcher: async (_input, init) => {
+        requestCount += 1;
+        requestBody = JSON.parse(String(init?.body ?? "{}"));
+        return responseFor({}, pdfSource, pdfPlan);
+      },
+    });
+
+    const messages = requestBody?.messages as Array<{ role: string; content: unknown }>;
+    const userMessage = messages.find((message) => message.role === "user");
+    const blocks = userMessage?.content as Array<Record<string, unknown>>;
+    expect(blocks[0]?.type).toBe("text");
+    expect(String(blocks[0]?.text)).toContain("pdf-page-2-text-1");
+    expect(String(blocks[0]?.text)).not.toContain("pdf-page-2-ocr-1");
+    expect(String(blocks[0]?.text)).not.toContain("vision-ocr");
+    expect(String(blocks[0]?.text)).not.toContain("data:image/jpeg;base64");
+    expect(String(blocks[0]?.text)).toContain("pdf-page-cost-test-source-page-2");
+    expect(requestBody?.max_tokens).toBe(10_000);
+    expect(requestCount).toBe(1);
+    expect(blocks[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/jpeg;base64,aW1hZ2U=" },
+    });
+  });
+
+  it("uses the Strict Tool Calling nullable schema form supported by DeepSeek", () => {
+    const properties = deepSeekReviewTool.function.parameters.properties as Record<string, unknown>;
+    const sections = properties.sections as { items: { properties: Record<string, unknown> } };
+    const placement = sections.items.properties.placement as { properties: Record<string, unknown> };
+    const parentNodeId = placement.properties.parentNodeId as Record<string, unknown>;
+
+    expect(parentNodeId).toHaveProperty("anyOf", [
+      { type: "string" },
+      { type: "null" },
+    ]);
+  });
+
+  it("exposes page coverage, formula, and image placement fields in the strict review schema", () => {
+    const parameters = deepSeekReviewTool.function.parameters as {
+      properties: {
+        pageCoverage: unknown;
+        sections: { items: { properties: Record<string, unknown> } };
+      };
+    };
+    const sectionProperties = parameters.properties.sections.items.properties;
+
+    expect(parameters.properties.pageCoverage).toBeTruthy();
+    expect(sectionProperties.formulas).toBeTruthy();
+    expect(sectionProperties.imagePlacements).toBeTruthy();
+  });
+
   it("calculates DeepSeek V4 Pro cost from cache and completion usage", () => {
     const usage: ReviewModelUsage = {
       promptTokens: 100,
@@ -137,7 +348,7 @@ describe("review usage accounting", () => {
     });
     expect(result.usage?.estimatedCostCny).toBeGreaterThan(0);
     expect(bodies).toHaveLength(2);
-    expect(bodies[0].max_tokens).toBe(6000);
+    expect(bodies[0].max_tokens).toBe(10_000);
     expect(bodies[1].max_tokens).toBe(10000);
     expect(bodies[0].thinking).toEqual({ type: "disabled" });
     expect(bodies[1].thinking).toEqual({ type: "disabled" });

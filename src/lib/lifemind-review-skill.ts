@@ -53,6 +53,37 @@ export type ReviewAnalysisPlacement = {
   targetNodeId: string | null;
 };
 
+export type ReviewAnalysisPageCoverageStatus = "covered" | "uncertain" | "unreadable";
+
+export type ReviewAnalysisPageCoverage = {
+  sourceId: string;
+  page: number;
+  status: ReviewAnalysisPageCoverageStatus;
+  sectionIds: string[];
+  evidenceIds: string[];
+  summary: string;
+};
+
+export type ReviewAnalysisFormula = {
+  id: string;
+  latex: string;
+  display: "inline" | "block";
+  sourcePage: number;
+  evidenceId?: string;
+  anchor?: string;
+  confidence: AnalysisConfidence;
+};
+
+export type ReviewAnalysisImagePlacement = {
+  assetId: string;
+  sourcePage: number;
+  placement: "before-section" | "after-section" | "inline";
+  anchor?: string;
+  caption?: string;
+  alt?: string;
+  confidence: AnalysisConfidence;
+};
+
 export type ReviewAnalysisSection = {
   id: string;
   sourceId: string;
@@ -65,6 +96,8 @@ export type ReviewAnalysisSection = {
   status: GeneratedNote["status"];
   existingNoteTitle?: string;
   body: string;
+  formulas: ReviewAnalysisFormula[];
+  imagePlacements: ReviewAnalysisImagePlacement[];
   evidence: string[];
 };
 
@@ -81,6 +114,7 @@ export type ReviewAnalysisRelation = {
 export type ReviewAnalysisPlan = {
   protocolVersion: typeof REVIEW_ANALYSIS_PROTOCOL_VERSION;
   stackDecisions: ReviewAnalysisStackDecision[];
+  pageCoverage?: ReviewAnalysisPageCoverage[];
   sections: ReviewAnalysisSection[];
   relations: ReviewAnalysisRelation[];
   corrections: Correction[];
@@ -158,6 +192,27 @@ export type ReviewAnalysisRequest = {
   locale: "zh-CN";
   reviewMode?: "single-pass" | "draft-pass" | "final-pass" | "repair-pass";
   sources: IntakeSource[];
+  pdfEvidenceImages?: Array<{
+    sourceId: string;
+    page: number;
+    assetId: string;
+    kind: "page" | "embedded";
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    imageDataUrl: string;
+  }>;
+  pdfPageManifest?: Array<{
+    sourceId: string;
+    totalPages: number;
+    pages: number[];
+    imagePagesSent: number[];
+    imagePagesOmitted: number[];
+    embeddedImages: Array<{ assetId: string; page: number; x: number; y: number; width: number; height: number }>;
+    embeddedImagesSent: string[];
+    embeddedImagesOmitted: string[];
+  }>;
   vaultContext?: VaultKnowledgeContext;
   vaultIndex?: VaultKnowledgeNode[];
   sourceOrganizationSignals?: SourceOrganizationSignal[];
@@ -197,6 +252,14 @@ export type ReviewAnalysisValidationOptions = {
   knownRootNames?: string[];
   taxonomyCandidates?: VaultTaxonomyCandidate[];
   vaultIndex?: VaultKnowledgeNode[];
+  allowedPdfImageEvidence?: Array<{
+    sourceId: string;
+    page: number;
+    assetId: string;
+    kind: "page" | "embedded";
+  }>;
+  allowTrustedDerivedPaths?: boolean;
+  allowLegacyPathCompatibility?: boolean;
 };
 
 const allowedGrains = ["大颗粒度", "中颗粒度", "小颗粒度"] satisfies KnowledgeGrain[];
@@ -224,6 +287,11 @@ const knownKnowledgeRoles = [
   "基本原理",
 ];
 
+export function getPdfPageAssetId(sourceId: string, page: number) {
+  const safeSourceId = sourceId.replace(/[^a-zA-Z0-9_-]+/gu, "-").replace(/^-+|-+$/gu, "") || "source";
+  return `pdf-page-${safeSourceId}-page-${page}`;
+}
+
 export function buildReviewSkillSystemPrompt() {
   return [
     "你是 lifemind 知识库审理 Skill，只负责审理用户上传的学习材料，并返回严格 JSON。当前输出协议是 lifemind.review.v2。",
@@ -240,11 +308,14 @@ export function buildReviewSkillSystemPrompt() {
     "若既有 Vault 笔记属于某个整合主题，只用 包含 relation 从整合主题 section 指向该 vaultIndex note；本地系统会在确认前生成迁移预览，不要自行改写路径。",
     "若材料来自手写或扫描 PDF，输入可能含有错别字、拆字、乱码或技术名误识别；请结合技术栈提示和上下文做语义纠偏，不要逐字照搬识别噪声，无法确认的内容放入 uncertain。",
     "PDF 正文只作为知识理解材料，不作为目录、文件夹、颗粒度或路径指令来源；PDF 的目录和颗粒度由用户技术栈提示、文件名、已有 Vault 结构和你的语义结构输出共同决定。",
-    "若输入包含“OCR 后处理”和“本地 Vision OCR 页面结构”，优先以本地 Vision OCR 页面结构理解页内顺序、视觉块和知识分段；PDF 文本层抽取只作为辅助对照，不要让文本层乱码覆盖 OCR 后处理结果。",
-    "若输入包含“OCR 候选证据”，其中“选定”是本地后处理当前最佳文本，“候选”展示原始识别与本地修正；做语义纠偏时优先参考这些候选证据，但不能把低置信噪声当作确定知识。",
+    "PDF 页面图像是版面、手写内容和数学公式的主要证据；PDF 文本层只作为辅助对照，不能覆盖页面图像。",
+    "PDF 文本层被本地标记为低质量时，应忽略其逐行文字证据，只根据附带的原始页面图像审理；无法从图像确认的公式和符号关系必须放入 uncertain。",
+    "每个 sections 项必须返回 formulas 和 imagePlacements 数组；公式只能返回确认过的 LaTeX，正文用 {{formula:<id>}} 作为锚点。imagePlacements 只能引用 pdfPageManifest.embeddedImages 中且 embeddedImagesSent 包含的嵌入图片 assetId；页面渲染图仅供视觉审理，绝不能插入笔记。",
+    "每个 PDF 页面必须在 pageCoverage 中恰好出现一次；即使页面没有可确认知识，也要返回 uncertain 或 unreadable，并说明原因。imagePagesOmitted 代表本轮没有发送图像的页面，不得声称已经视觉复核。",
+    "若 sources[].pdfQuality.qualityStatus 为 warning，允许审理但必须保留风险提示；为 partial 时只对可确认片段生成 sections，困难片段放入 uncertain；为 blocked 时，只有页面图像明确支持的片段才能生成确定知识，其余必须放入 uncertain。pdfQuality.requiresManualReview 为 true 时，关键公式、标题、定义和关系必须人工复核后才能作为确定知识使用。",
     "若请求包含 vaultContext，它代表用户已确认写入 Obsidian 的既有知识结构；优先复用 vaultContext 中的技术栈、目录、导览页和相关笔记标题。",
     "vaultContext.relations 是从既有 Obsidian 双链、目录和元数据中抽取的关系边；审理新材料时应优先沿用这些边附近的结构。",
-    "若请求包含 sourceOrganizationSignals，它是本地从用户填写信息、来源标题、显式颗粒度字段、显式箭头层级和 stackHint 中提取出的组织意图信号；PDF 的 OCR 正文不会用于提取该信号；它不包含推荐路径，不能替代你的语义判断。",
+    "若请求包含 sourceOrganizationSignals，它是本地从用户填写信息、来源标题、显式颗粒度字段、显式箭头层级和 stackHint 中提取出的组织意图信号；PDF 页面内容不会用于提取该信号；它不包含推荐路径，不能替代你的语义判断。",
     "若请求包含 taxonomyCandidates，它代表从全库索引目录骨架中整理出的归类候选；taxonomyCandidates 是候选集合，不是强制路径。",
     "新协议中不要输出 sections[].path；请使用 sections[].placement 选择 vaultIndex 中的节点 ID。旧协议 path 只用于兼容历史请求。",
     "placement.parentNodeId、placement.targetNodeId、relations[].sourceNodeId 和 relations[].targetNodeId 只能填写 vaultIndex 中真实存在的 ID，不能自行拼接路径或猜测标题。",
@@ -266,7 +337,7 @@ export function buildReviewSkillSystemPrompt() {
     "相似旧笔记只用于建立关系，不等于分类目录；不要仅因为某旧笔记相关，就把新术语塞进该旧笔记所在分支。",
     "若请求 reviewMode 为 final-pass 且包含 previousAnalysisPlan，请把 previousAnalysisPlan 当作第一轮草案进行复审：保留正确判断，修正结构、命名、拆分颗粒度和关系，并只返回最终定稿 JSON。",
     "若请求包含 protocolRepair 或 reviewMode 为 repair-pass，这是对协议格式的定向修复：优先保留原有知识判断，忽略不完整或损坏的 previousOutput，基于原始 sources 重新生成一个完整、紧凑、可解析的 JSON；不要逐字复述整篇 PDF，不要增加无关 sections。",
-    "普通文本来源的技术栈根目录和放置节点必须能在来源标题、正文或已有目录候选中找到语义依据；PDF 来源的放置节点由你的语义结构输出决定，但不能使用 OCR 噪声、页眉页脚、文件管理描述或泛化桶名；如果无法确认，放入 uncertain，不要编造节点。",
+    "普通文本来源的技术栈根目录和放置节点必须能在来源标题、正文或已有目录候选中找到语义依据；PDF 来源的放置节点由你的语义结构输出决定，但不能使用页面提取噪声、页眉页脚、文件管理描述或泛化桶名；如果无法确认，放入 uncertain，不要编造节点。",
     "旧协议 path 最多使用三层相对目录；新协议通过节点 ID 表达放置位置。",
     "遇到同一技术栈的新材料时，不要重新创建孤立根目录；应沿用既有根目录，并通过前置知识、包含、递进等关系连接到既有笔记。",
     "控制颗粒度：少量材料通常生成 2-4 篇笔记，最多 5 篇；不要把每一个命令、步骤、短句都单独生成小颗粒度笔记。",
@@ -302,12 +373,94 @@ export function createReviewAnalysisRequest(
   const sourceStructure = analyzeSourceStructures(sources).map(toSourceStructureSignal);
   const taxonomyCandidates = buildTaxonomyCandidates(normalizedVaultContext);
   const vaultIndex = buildVaultKnowledgeIndex(vaultContext);
+  const pageImageCandidates = sources.flatMap((source) =>
+    (source.pdfEvidence?.pages ?? [])
+      .filter((page) => page.imageReviewRequired && isBoundedImageDataUrl(page.imageDataUrl))
+      .map((page) => ({
+        sourceId: source.id,
+        page: page.page,
+        assetId: getPdfPageAssetId(source.id, page.page),
+        kind: "page" as const,
+        imageDataUrl: page.imageDataUrl as string,
+      })),
+  );
+  const embeddedImageCandidates = sources.flatMap((source) =>
+    (source.pdfEvidence?.images ?? [])
+      .filter((image) => isBoundedImageDataUrl(image.imageDataUrl))
+      .map((image, index) => ({
+        sourceId: source.id,
+        page: image.page,
+        assetId: image.assetId || `pdf-image-${source.id.replace(/[^a-zA-Z0-9_-]+/gu, "-")}-page-${image.page}-${index + 1}`,
+        kind: "embedded" as const,
+        x: image.x,
+        y: image.y,
+        width: image.width,
+        height: image.height,
+        imageDataUrl: image.imageDataUrl as string,
+      })),
+  );
+  const pdfEvidenceImages = [
+    ...pageImageCandidates.slice(0, 8),
+    ...embeddedImageCandidates.slice(0, 8),
+  ];
+  const pdfPageManifest = sources.flatMap((source) => {
+    if (source.type !== "pdf" || !source.pdfEvidence?.pages.length) return [];
+
+    const pages = source.pdfEvidence.pages.map((page) => page.page);
+    const imagePagesSent = pdfEvidenceImages
+      .filter((image) => image.sourceId === source.id && image.kind === "page")
+      .map((image) => image.page);
+    const embeddedImages = (source.pdfEvidence.images ?? []).map((image, index) => ({
+      assetId: image.assetId || `pdf-image-${source.id.replace(/[^a-zA-Z0-9_-]+/gu, "-")}-page-${image.page}-${index + 1}`,
+      page: image.page,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height,
+    }));
+    const embeddedImagesSent = pdfEvidenceImages
+      .filter((image) => image.sourceId === source.id && image.kind === "embedded")
+      .map((image) => image.assetId);
+
+    return [
+      {
+        sourceId: source.id,
+        totalPages: pages.length,
+        pages,
+        imagePagesSent,
+        imagePagesOmitted: pages.filter((page) => !imagePagesSent.includes(page)),
+        embeddedImages,
+        embeddedImagesSent,
+        embeddedImagesOmitted: embeddedImages
+          .map((image) => image.assetId)
+          .filter((assetId) => !embeddedImagesSent.includes(assetId)),
+      },
+    ];
+  });
+  const modelSources = sources.map((source) => ({
+    ...source,
+    ...(source.pdfEvidence
+      ? {
+          pdfEvidence: {
+            ...source.pdfEvidence,
+              pages: source.pdfEvidence.pages.map(({ imageDataUrl: _imageDataUrl, evidence, ...page }) => ({
+                ...page,
+                assetId: page.assetId ?? getPdfPageAssetId(source.id, page.page),
+                evidence: evidence.filter((line) => line.source !== "vision-ocr"),
+              })),
+              images: source.pdfEvidence.images?.map(({ imageDataUrl: _imageDataUrl, ...image }) => image),
+          },
+        }
+      : {}),
+  }));
 
   return {
     protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
     task: "review_uploaded_knowledge",
     locale: "zh-CN",
-    sources,
+    sources: modelSources,
+    ...(pdfEvidenceImages.length > 0 ? { pdfEvidenceImages } : {}),
+    ...(pdfPageManifest.length > 0 ? { pdfPageManifest } : {}),
     ...(normalizedVaultContext ? { vaultContext: normalizedVaultContext } : {}),
     ...(vaultIndex.length > 0 ? { vaultIndex } : {}),
     ...(sourceOrganizationSignals.length > 0 ? { sourceOrganizationSignals } : {}),
@@ -319,25 +472,28 @@ export function createReviewAnalysisRequest(
       "这是结构分析协议，不要输出最终 notes[].markdown 或自由 path；输出 sections[].body 和 placement，由本地编译器生成最终 Markdown。",
       "示例、注释和代码块只能作为证据，不得扩写成新的知识点。",
       "不要把示例、注释或代码块里的例子当成新的结论去单独命名笔记。",
-      "用户填写的技术栈是根目录约束，不是可被模型替换的建议；若填写了 stackHint，必须原样使用其第一段名称。",
+      "用户填写的技术栈是根目录约束，不是可被模型替换的建议",
+      "若填写了 stackHint，必须原样使用其第一段名称。",
       "没有 stackHint 时也不能凭默认类别归类；根目录必须有来源标题、首段或正文主题依据。",
-      "每个 sources[].id 必须有一个 stackDecisions 项；无法判断的内容放 uncertain，但不能用 AI 等无关类别替换明确技术栈。",
-      "sourceOrganizationSignals 是用户组织意图信号，不是最终路径；PDF OCR 正文不会被本地提取为目录/颗粒度信号；taxonomyCandidates 是候选集合，不是强制路径。",
+    "每个 sources[].id 必须有一个 stackDecisions 项；无法判断的内容放 uncertain，但不能用 AI 等无关类别替换明确技术栈。",
+    "PDF 的 evidenceIds/evidenceId 必须精确引用对应页 sources[].pdfEvidence.pages[].evidence[].id；页面图像只有在 imagePagesSent 标记已发送时才能作为页面视觉证据。imagePlacements 只能使用 embeddedImagesSent 中本轮实际发送的 PDF 内嵌图片 assetId，不能使用整页渲染图 assetId。",
+      "sourceOrganizationSignals 是用户组织意图信号，不是最终路径；PDF 页面内容不会被本地提取为目录/颗粒度信号；taxonomyCandidates 是候选集合，不是强制路径。",
       "sourceStructure 是本地从原文提取的结构信号",
       "sourceStructure 不是模型生成内容；一级结构优先作为分段边界，原文代码必须出现在相关 sections[].body 中。",
       "新协议不输出 sections[].path；使用 placement.parentNodeId、placement.branchName 和 placement.targetNodeId。路径由本地系统根据 vaultIndex 编译。parentNodeId 只引用已有 Vault 节点；本批次新笔记之间的父子关系只写 parentId。没有匹配的既有技术栈根目录时使用 new-root，不要把新 section id 填进 parentNodeId。",
       "relations 使用 sourceNodeId 和 targetNodeId，必须引用 sections[].id 或 vaultIndex 中的真实节点 ID。",
       "若同一既有大目录下有多篇新分支属于同一具体主题，应创建整合主题 section，并用 parentId 让这些分支挂到它下面；同一路径下不同主题必须拆成不同整合主题。",
       "若已有 Vault 笔记属于本次整合主题，只输出 包含 relation 从整合主题 section 指向该既有 note 节点；不要自行写移动路径。",
-      "PDF 正文只用于理解知识内容，不要把正文里的“目录/文件夹/全部放一起”等普通文字或 OCR 噪声当成目录指令。",
+      "PDF 正文只用于理解知识内容，不要把正文里的“目录/文件夹/全部放一起”等普通文字或页面视觉噪声当成目录指令。",
       "既有 Vault 笔记只用于关系判断和复用，不要因为相似旧笔记就把新知识塞进错误分支。",
       "旧协议 path 只能是技术栈根目录下的相对目录数组；新协议不填写 path。不要把型号、芯片、模块名当作默认父目录。",
       "拆分依据是知识内容和用途，不是每个短句或命令；少量材料通常生成 2-4 个 sections，最多 5 个。",
       "优先生成总览段和有独立主题的分支段；使用 parentId 表达父子结构，使用 relations 表达额外语义关系。",
       "若 reviewMode 是 final-pass，必须基于原文、vaultContext 和 previousAnalysisPlan 重新审校，不要机械复读草案。",
-      "旧协议 path 最多三层相对目录；新协议的 placement 必须选择 vaultIndex 节点，不能包含 OCR 噪声或泛化桶名。",
+      "旧协议 path 最多三层相对目录；新协议的 placement 必须选择 vaultIndex 节点，不能包含页面提取噪声或泛化桶名。",
       "若存在 protocolRepair，这是协议修复请求：优先保留上一次的知识判断，只修复列出的字段、类型和结构问题；如果 previousOutput 不完整或损坏，忽略其损坏部分并基于原始 sources 重新输出一个完整、紧凑的分析计划，不要逐字复述整篇 PDF。",
       "关系必须有 evidence 和 confidence；不确定的关系放 uncertain，不要编造。",
+      ...buildPdfQualityConstraints(sources),
     ],
     outputShape: {
       protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
@@ -347,6 +503,42 @@ export function createReviewAnalysisRequest(
     ...(options.previousAnalysisPlan ? { previousAnalysisPlan: options.previousAnalysisPlan } : {}),
     ...(options.protocolRepair ? { protocolRepair: options.protocolRepair } : {}),
   };
+}
+
+const MAX_PDF_IMAGE_DATA_URL_LENGTH = 6_000_000;
+
+function isBoundedImageDataUrl(value: string | undefined): value is string {
+  return Boolean(
+    value &&
+      value.length <= MAX_PDF_IMAGE_DATA_URL_LENGTH &&
+      /^data:image\/(?:jpeg|jpg|png);base64,[A-Za-z0-9+/=]+$/u.test(value),
+  );
+}
+
+function buildPdfQualityConstraints(sources: IntakeSource[]) {
+  const qualitySources = sources.filter((source) => source.pdfQuality);
+
+  if (qualitySources.length === 0) return [];
+
+  return [
+    "sources[].pdfQuality 是本地 PDF 抽取质量评估，不是模型可以修改的建议；必须按它限制确定知识的生成。",
+    ...qualitySources.map((source) => {
+      const quality = source.pdfQuality;
+      const status = quality?.qualityStatus ?? "normal";
+      const rule =
+        status === "partial"
+          ? "只允许对可确认片段生成 sections，困难片段放入 uncertain。"
+          : status === "blocked"
+            ? source.pdfEvidence?.pages.some((page) => page.imageReviewRequired && page.imageDataUrl)
+              ? "先对对应页图像进行视觉复核；只有视觉证据明确确认的片段才能生成 sections，其余放入 uncertain。"
+              : "不得生成确定知识。"
+            : status === "warning"
+              ? "允许审理但必须保留风险提示。"
+              : "可按正常流程审理。";
+      const visualReview = source.pdfEvidence?.pages.some((page) => page.imageReviewRequired && page.imageDataUrl);
+      return `来源“${source.title}”的 PDF 困难文字占比约 ${Math.round((quality?.difficultyRatio ?? 0) * 100)}%，状态为 ${status}；${rule}${quality?.requiresManualReview ? "需要人工复核。" : ""}${visualReview ? "视觉复核证据已附在请求中。" : ""}`;
+    }),
+  ];
 }
 
 export function createReviewSkillRequest(
@@ -378,9 +570,9 @@ export function createReviewSkillRequest(
       "若 reviewMode 是 final-pass，必须基于原文、vaultContext 和 previousOutput 重新审校，不要机械复读第一轮。",
       "示例、注释和代码块只能作为证据，不得扩写成新的知识点。",
       "不要把示例、注释或代码块里的例子当成新的结论去单独命名笔记。",
-      "sourceOrganizationSignals 是用户组织意图信号；它不提供最终路径；PDF OCR 正文不会被本地提取为目录/颗粒度信号；当它与 taxonomyCandidates 冲突时，应优先解释用户意图再决定路径。",
+      "sourceOrganizationSignals 是用户组织意图信号；它不提供最终路径；PDF 页面内容不会被本地提取为目录/颗粒度信号；当它与 taxonomyCandidates 冲突时，应优先解释用户意图再决定路径。",
       "新协议优先使用 notes[].placement 和 vaultIndex 节点 ID；不要让模型直接编写自由路径。",
-      "PDF 正文只用于理解知识内容，不要把正文里的“目录/文件夹/全部放一起”等普通文字或 OCR 噪声当成目录指令。",
+      "PDF 正文只用于理解知识内容，不要把正文里的“目录/文件夹/全部放一起”等普通文字或页面视觉噪声当成目录指令。",
       "sourceOrganizationSignals[].explicitHierarchy 是用户显式写出的层级意图；如果正文主题与该层级一致，优先把本批次主题放入该层级，且不要被相似旧目录吞掉。",
       "生成 notes[].path 前必须先查看 taxonomyCandidates；taxonomyCandidates 是分类候选，vaultContext.notes 是相关旧知识，不要混用。",
       "vaultContext.notes[].path 只用于定位关系参考笔记，不用于推断新笔记目录。",
@@ -430,7 +622,7 @@ export function extractSourceOrganizationSignals(
   return sources.flatMap((source) => {
     const searchable = buildLocalOrganizationSearchable(source);
     const inferredRoot = inferOrganizationRoot(source, context, searchable);
-    const explicitHierarchy = readExplicitHierarchy(searchable, inferredRoot);
+    const explicitHierarchy = readExplicitHierarchy(searchable, "");
     const root = explicitHierarchy[0] ?? inferredRoot;
     const role =
       readFirstDirectiveValue(searchable, ["新建中颗粒度", "中颗粒度", "中等颗粒度", "中层", "二级目录", "目录", "文件夹"]) ||
@@ -942,12 +1134,23 @@ export function validateReviewAnalysisPlan(
     sourceIds,
     errors,
   );
+  const pageCoverage = validatePageCoverage(
+    candidate.pageCoverage,
+    sources,
+    errors,
+    options.allowedPdfImageEvidence ?? [],
+  );
   const sections = validateAnalysisSections(
     readRequiredArray(candidate, "sections", errors),
     sourceIds,
     errors,
   );
-  const normalizedSections = normalizeBatchLocalPlacements(sections, stackDecisions, options);
+  const normalizedSections = normalizeLegacyAnalysisPaths(
+    normalizeBatchLocalPlacements(sections, stackDecisions, options),
+    sources,
+    stackDecisions,
+    options,
+  );
   const relations = validateAnalysisRelations(readRequiredArray(candidate, "relations", errors), errors);
   const corrections = validateCorrections(
     readRequiredArray(candidate, "corrections", errors),
@@ -956,7 +1159,7 @@ export function validateReviewAnalysisPlan(
   );
   const uncertain = validateUncertain(readRequiredArray(candidate, "uncertain", errors), errors);
 
-  validateAnalysisStructure(stackDecisions, normalizedSections, relations, sources, errors, options);
+  validateAnalysisStructure(stackDecisions, normalizedSections, relations, sources, errors, options, pageCoverage);
   validateAnalysisGranularityPolicy(normalizedSections, sources, errors);
   validateAnalysisSemanticQuality(stackDecisions, normalizedSections, sources, errors, options);
 
@@ -967,6 +1170,7 @@ export function validateReviewAnalysisPlan(
     output: {
       protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
       stackDecisions,
+      ...(pageCoverage ? { pageCoverage } : {}),
       sections: normalizedSections,
       relations,
       corrections,
@@ -1026,6 +1230,37 @@ function normalizeBatchLocalPlacements(
   });
 }
 
+function normalizeLegacyAnalysisPaths(
+  sections: ReviewAnalysisSection[],
+  sources: IntakeSource[],
+  stackDecisions: ReviewAnalysisStackDecision[],
+  options: ReviewAnalysisValidationOptions,
+) {
+  if (!options.allowLegacyPathCompatibility || options.allowTrustedDerivedPaths || !(options.taxonomyCandidates?.length ?? 0)) {
+    return sections;
+  }
+
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  const stackBySourceId = new Map(stackDecisions.map((decision) => [decision.sourceId, decision.name]));
+
+  return sections.map((section) => {
+    if (section.placement || !section.path) return section;
+
+    const source = sourceById.get(section.sourceId);
+    const root = stackBySourceId.get(section.sourceId) ?? "";
+    if (!source || !root) return section;
+
+    const path = section.path.filter((segment, index) => {
+      if (index === 0 && normalizeComparableReference(segment) === normalizeComparableReference(root)) return true;
+      if (hasNoisyPathSegment(segment) || isGenericOrganizationBucketSegment(segment)) return true;
+      if (source.type === "pdf") return true;
+      return isSupportedPathSegment(segment, section.title, buildLocalOrganizationSearchable(source), options.taxonomyCandidates ?? [], root);
+    });
+
+    return { ...section, path };
+  });
+}
+
 function validateAnalysisStackDecisions(
   items: unknown[],
   sourceIds: Set<string>,
@@ -1061,6 +1296,96 @@ function validateAnalysisStackDecisions(
   });
 }
 
+function validatePageCoverage(
+  value: unknown,
+  sources: IntakeSource[],
+  errors: ReviewSkillValidationError[],
+  allowedPdfImageEvidence: ReviewAnalysisValidationOptions["allowedPdfImageEvidence"] = [],
+): ReviewAnalysisPageCoverage[] | undefined {
+  if (value === undefined) {
+    const requiresCoverage = sources.some((source) => source.type === "pdf" && (source.pdfEvidence?.pages.length ?? 0) > 0);
+    if (requiresCoverage) {
+      errors.push({ path: "$.pageCoverage", message: "包含页面证据的 PDF 必须返回每页 pageCoverage。" });
+    }
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    errors.push({ path: "$.pageCoverage", message: "字段必须是数组。" });
+    return [];
+  }
+
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  const seen = new Set<string>();
+  const coverage: ReviewAnalysisPageCoverage[] = [];
+
+  value.forEach((item, index) => {
+    const path = `$.pageCoverage[${index}]`;
+    if (!isRecord(item)) {
+      errors.push({ path, message: "页面覆盖项必须是对象。" });
+      return;
+    }
+
+    const sourceId = readRequiredString(item, "sourceId", `${path}.sourceId`, errors);
+    const page = readRequiredInteger(item, "page", `${path}.page`, errors);
+    const status = readEnum(item, "status", ["covered", "uncertain", "unreadable"] as const, `${path}.status`, errors);
+    const sectionIds = readStringArray(item, "sectionIds", `${path}.sectionIds`, errors);
+    const evidenceIds = readStringArray(item, "evidenceIds", `${path}.evidenceIds`, errors);
+    const summary = readRequiredString(item, "summary", `${path}.summary`, errors);
+
+    if (sourceId && !sourceById.has(sourceId)) {
+      errors.push({ path: `${path}.sourceId`, message: "sourceId 必须来自输入 sources。" });
+    }
+
+    const source = sourceById.get(sourceId);
+    const pageKey = `${sourceId}:${page}`;
+    if (sourceId && page > 0 && seen.has(pageKey)) {
+      errors.push({ path: `${path}.page`, message: "同一来源的页面不能重复覆盖。" });
+    }
+    if (sourceId && page > 0) seen.add(pageKey);
+
+    const sourcePage = source?.pdfEvidence?.pages.find((candidate) => candidate.page === page);
+    if (source?.type === "pdf" && source.pdfEvidence?.pages.length && !sourcePage) {
+      errors.push({ path: `${path}.page`, message: `页面 ${page} 不在该 PDF 的输入页面范围内。` });
+    }
+
+    if (sourcePage && evidenceIds) {
+      const evidenceIdsInPage = new Set(sourcePage.evidence.map((line) => line.id));
+      const allowedImageAssetIds = new Set(
+        allowedPdfImageEvidence
+          ?.filter((image) => image.sourceId === sourceId && image.page === page)
+          .map((image) => image.assetId) ?? [],
+      );
+      evidenceIds.forEach((evidenceId, evidenceIndex) => {
+        if (!evidenceIdsInPage.has(evidenceId) && !allowedImageAssetIds.has(evidenceId)) {
+          errors.push({
+            path: `${path}.evidenceIds[${evidenceIndex}]`,
+            message: "evidenceId 必须来自对应 PDF 页面的证据。",
+          });
+        }
+      });
+    }
+
+    if (sourceId && page > 0 && status && sectionIds && evidenceIds && summary) {
+      coverage.push({ sourceId, page, status, sectionIds, evidenceIds, summary });
+    }
+  });
+
+  for (const source of sources) {
+    const pages = source.pdfEvidence?.pages ?? [];
+    if (source.type !== "pdf" || pages.length === 0) continue;
+
+    const coveredPages = new Set(coverage.filter((item) => item.sourceId === source.id).map((item) => item.page));
+    for (const page of pages) {
+      if (!coveredPages.has(page.page)) {
+        errors.push({ path: "$.pageCoverage", message: `来源“${source.title}”缺少第 ${page.page} 页覆盖结果。` });
+      }
+    }
+  }
+
+  return coverage;
+}
+
 function validateAnalysisSections(
   items: unknown[],
   sourceIds: Set<string>,
@@ -1088,6 +1413,14 @@ function validateAnalysisSections(
     const status = readEnum(item, "status", allowedStatuses, `${path}.status`, errors);
     const existingNoteTitle = readOptionalString(item, "existingNoteTitle");
     const body = readRequiredString(item, "body", `${path}.body`, errors);
+    const formulas = readAnalysisFormulas(item, `${path}.formulas`, sourceId, body, errors);
+    const imagePlacements = readAnalysisImagePlacements(
+      item,
+      `${path}.imagePlacements`,
+      sourceId,
+      body,
+      errors,
+    );
     const evidence = readStringArray(item, "evidence", `${path}.evidence`, errors);
 
     if (!sourceId) {
@@ -1106,7 +1439,19 @@ function validateAnalysisSections(
         message: "新协议必须提供 placement；兼容旧协议时必须提供合法 path。",
       });
     }
-    if (!id || !sourceId || !title || !role || !grain || (!sectionPath && !placement) || !status || !body || !evidence) {
+    if (
+      !id ||
+      !sourceId ||
+      !title ||
+      !role ||
+      !grain ||
+      (!sectionPath && !placement) ||
+      !status ||
+      !body ||
+      !formulas ||
+      !imagePlacements ||
+      !evidence
+    ) {
       return [];
     }
 
@@ -1123,10 +1468,133 @@ function validateAnalysisSections(
         status,
         ...(existingNoteTitle ? { existingNoteTitle } : {}),
         body,
+        formulas,
+        imagePlacements,
         evidence,
       },
     ];
   });
+}
+
+function readAnalysisFormulas(
+  record: Record<string, unknown>,
+  path: string,
+  sourceId: string,
+  body: string,
+  errors: ReviewSkillValidationError[],
+): ReviewAnalysisFormula[] | null {
+  const value = record.formulas;
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    errors.push({ path, message: "formulas 必须是数组。" });
+    return null;
+  }
+
+  const seenIds = new Set<string>();
+  const formulas: ReviewAnalysisFormula[] = [];
+  value.forEach((item, index) => {
+    const itemPath = `${path}[${index}]`;
+    if (!isRecord(item)) {
+      errors.push({ path: itemPath, message: "公式项必须是对象。" });
+      return;
+    }
+    const id = readRequiredString(item, "id", `${itemPath}.id`, errors);
+    const latex = readRequiredString(item, "latex", `${itemPath}.latex`, errors);
+    const display = readEnum(item, "display", ["inline", "block"] as const, `${itemPath}.display`, errors);
+    const sourcePage = readRequiredInteger(item, "sourcePage", `${itemPath}.sourcePage`, errors);
+    const evidenceId = readOptionalString(item, "evidenceId");
+    const anchor = readOptionalString(item, "anchor");
+    const confidence = readEnum(item, "confidence", ["高", "中", "低"] as const, `${itemPath}.confidence`, errors);
+
+    if (id && seenIds.has(id)) errors.push({ path: `${itemPath}.id`, message: "公式 id 不能重复。" });
+    if (id) seenIds.add(id);
+    if (latex && /(?:<\/?[a-z]|data:|javascript:)/iu.test(latex)) {
+      errors.push({ path: `${itemPath}.latex`, message: "LaTeX 不能包含 HTML、data URL 或脚本内容。" });
+    }
+    const marker = `{{formula:${id}}}`;
+    if (id && !body.includes(marker)) {
+      errors.push({ path: `${itemPath}.id`, message: `正文必须包含公式锚点 ${marker}。` });
+    }
+    if (id && body.split(marker).length - 1 > 1) {
+      errors.push({ path: `${itemPath}.id`, message: `公式锚点 ${marker} 只能出现一次。` });
+    }
+    if (id && latex && display && sourcePage > 0 && confidence) {
+      formulas.push({
+        id,
+        latex,
+        display,
+        sourcePage,
+        ...(evidenceId ? { evidenceId } : {}),
+        ...(anchor ? { anchor } : {}),
+        confidence,
+      });
+    }
+  });
+
+  return formulas;
+}
+
+function readAnalysisImagePlacements(
+  record: Record<string, unknown>,
+  path: string,
+  _sourceId: string,
+  body: string,
+  errors: ReviewSkillValidationError[],
+): ReviewAnalysisImagePlacement[] | null {
+  const value = record.imagePlacements;
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    errors.push({ path, message: "imagePlacements 必须是数组。" });
+    return null;
+  }
+
+  const placements: ReviewAnalysisImagePlacement[] = [];
+  value.forEach((item, index) => {
+    const itemPath = `${path}[${index}]`;
+    if (!isRecord(item)) {
+      errors.push({ path: itemPath, message: "图片放置项必须是对象。" });
+      return;
+    }
+    const assetId = readRequiredString(item, "assetId", `${itemPath}.assetId`, errors);
+    const sourcePage = readRequiredInteger(item, "sourcePage", `${itemPath}.sourcePage`, errors);
+    const placement = readEnum(
+      item,
+      "placement",
+      ["before-section", "after-section", "inline"] as const,
+      `${itemPath}.placement`,
+      errors,
+    );
+    const anchor = readOptionalString(item, "anchor");
+    const caption = readOptionalString(item, "caption");
+    const alt = readOptionalString(item, "alt");
+    const confidence = readEnum(item, "confidence", ["高", "中", "低"] as const, `${itemPath}.confidence`, errors);
+
+    if (assetId && !assetId.startsWith("pdf-image-")) {
+      errors.push({ path: `${itemPath}.assetId`, message: "图片放置只能引用从 PDF 内嵌提取的图片，不能引用整页渲染图。" });
+    }
+    if (placement === "inline") {
+      if (!anchor) {
+        errors.push({ path: `${itemPath}.anchor`, message: "inline 图片必须提供正文锚点。" });
+      } else if (!body.includes(anchor)) {
+        errors.push({ path: `${itemPath}.anchor`, message: "inline 图片锚点必须出现在正文中。" });
+      } else if (body.split(anchor).length - 1 > 1) {
+        errors.push({ path: `${itemPath}.anchor`, message: "inline 图片锚点只能出现一次。" });
+      }
+    }
+    if (assetId && sourcePage > 0 && placement && confidence) {
+      placements.push({
+        assetId,
+        sourcePage,
+        placement,
+        ...(anchor ? { anchor } : {}),
+        ...(caption ? { caption } : {}),
+        ...(alt ? { alt } : {}),
+        confidence,
+      });
+    }
+  });
+
+  return placements;
 }
 
 function validateAnalysisRelations(items: unknown[], errors: ReviewSkillValidationError[]) {
@@ -1178,11 +1646,30 @@ function validateAnalysisStructure(
   sources: IntakeSource[],
   errors: ReviewSkillValidationError[],
   options: ReviewAnalysisValidationOptions,
+  pageCoverage?: ReviewAnalysisPageCoverage[],
 ) {
   const sourceIds = new Set(sources.map((source) => source.id));
   const decisionBySourceId = new Map(stackDecisions.map((decision) => [decision.sourceId, decision]));
   const sectionIds = new Set(sections.map((section) => section.id));
   const vaultNodeById = new Map((options.vaultIndex ?? []).map((node) => [node.id, node]));
+  const sectionById = new Map(sections.map((section) => [section.id, section]));
+
+  for (const coverage of pageCoverage ?? []) {
+    for (const sectionId of coverage.sectionIds) {
+      const section = sectionById.get(sectionId);
+      if (!section) {
+        errors.push({
+          path: `$.pageCoverage[${(pageCoverage ?? []).indexOf(coverage)}].sectionIds`,
+          message: `sectionId “${sectionId}” 不存在。`,
+        });
+      } else if (section.sourceId !== coverage.sourceId) {
+        errors.push({
+          path: `$.pageCoverage[${(pageCoverage ?? []).indexOf(coverage)}].sectionIds`,
+          message: `sectionId “${sectionId}” 不属于来源“${coverage.sourceId}”。`,
+        });
+      }
+    }
+  }
 
   for (const source of sources) {
     const decision = decisionBySourceId.get(source.id);
@@ -1205,6 +1692,7 @@ function validateAnalysisStructure(
   }
 
   for (const section of sections) {
+    validateSectionMediaReferences(section, sources, errors, options);
     if (section.placement) {
       const placementPath = `$.sections[${sections.indexOf(section)}].placement`;
       const { mode, parentNodeId, targetNodeId } = section.placement;
@@ -1355,7 +1843,7 @@ function validateAnalysisStructure(
 
       errors.push({
         path: `$.relations[${index}].${endpoint}`,
-        message: "关系端点必须引用本次知识分段或既有 Vault 笔记/技术栈根节点。",
+        message: "关系端点必须引用本次知识分段或既有 Vault 笔记",
       });
     }
   }
@@ -1450,19 +1938,20 @@ function validateAnalysisSemanticQuality(
 
       const unsupportedSegments = section.placement
         ? []
-        : relativePath.filter(
-            (segment) =>
-              hasNoisyPathSegment(segment) ||
-              isGenericOrganizationBucketSegment(segment) ||
-              (!shouldTrustModelPdfPath &&
-                !isSupportedPathSegment(
+        : relativePath.filter((segment) => {
+            if (options.allowTrustedDerivedPaths) return false;
+            if (hasNoisyPathSegment(segment) || isGenericOrganizationBucketSegment(segment)) return true;
+            if (options.allowLegacyPathCompatibility) return false;
+            return shouldTrustModelPdfPath
+              ? false
+              : !isSupportedPathSegment(
                   segment,
                   section.title,
                   sourceText,
                   options.taxonomyCandidates ?? [],
                   decision.name,
-                )),
-          );
+                );
+          });
 
       if (unsupportedSegments.length > 0) {
         errors.push({
@@ -1481,6 +1970,77 @@ function validateAnalysisSemanticQuality(
       });
     }
   }
+}
+
+function validateSectionMediaReferences(
+  section: ReviewAnalysisSection,
+  sources: IntakeSource[],
+  errors: ReviewSkillValidationError[],
+  options: ReviewAnalysisValidationOptions,
+) {
+  const source = sources.find((candidate) => candidate.id === section.sourceId);
+  if (!source || source.type !== "pdf" || !source.pdfEvidence) {
+    if (section.formulas.length > 0 || section.imagePlacements.length > 0) {
+      errors.push({
+        path: `$.sections[${section.sourceId}]`,
+        message: "公式和图片放置只能引用 PDF 来源。",
+      });
+    }
+    return;
+  }
+
+  const pageByNumber = new Map(source.pdfEvidence.pages.map((page) => [page.page, page]));
+  section.formulas.forEach((formula, index) => {
+    const page = pageByNumber.get(formula.sourcePage);
+    if (!page) {
+      errors.push({
+        path: `$.sections[${section.id}].formulas[${index}].sourcePage`,
+        message: "公式来源页不在 PDF 页面证据中。",
+      });
+      return;
+    }
+    const allowedImageAssetIds = new Set(
+      options.allowedPdfImageEvidence
+        ?.filter((image) => image.sourceId === section.sourceId && image.page === formula.sourcePage)
+        .map((image) => image.assetId) ?? [],
+    );
+    if (
+      formula.evidenceId &&
+      !page.evidence.some((line) => line.id === formula.evidenceId) &&
+      !allowedImageAssetIds.has(formula.evidenceId)
+    ) {
+      errors.push({
+        path: `$.sections[${section.id}].formulas[${index}].evidenceId`,
+        message: "公式 evidenceId 不属于对应 PDF 页面。",
+      });
+    }
+  });
+
+  section.imagePlacements.forEach((image, index) => {
+    const page = pageByNumber.get(image.sourcePage);
+    if (!page) {
+      errors.push({
+        path: `$.sections[${section.id}].imagePlacements[${index}].sourcePage`,
+        message: "图片来源页不在 PDF 页面证据中。",
+      });
+      return;
+    }
+    const embeddedImage = source.pdfEvidence.images?.find((candidate) => candidate.assetId === image.assetId);
+    if (!embeddedImage || embeddedImage.page !== image.sourcePage) {
+      errors.push({
+        path: `$.sections[${section.id}].imagePlacements[${index}].assetId`,
+        message: "图片 assetId 必须对应该页实际提取的 PDF 内嵌图片。",
+      });
+    }
+    if (!embeddedImage?.imageDataUrl || !options.allowedPdfImageEvidence?.some(
+      (allowed) => allowed.sourceId === section.sourceId && allowed.page === image.sourcePage && allowed.assetId === image.assetId && allowed.kind === "embedded",
+    )) {
+      errors.push({
+        path: `$.sections[${section.id}].imagePlacements[${index}]`,
+        message: "图片放置只能引用本轮已发送的 PDF 内嵌图片资产。",
+      });
+    }
+  });
 }
 
 function validateSourceCodeEvidence(
@@ -1538,8 +2098,18 @@ function inferRootFromSourceTitle(title: string) {
   if (!normalizedTitle) return "";
 
   const latinPrefix = normalizedTitle.match(/^[A-Za-z][A-Za-z0-9+#.-]*/u)?.[0]?.trim() ?? "";
+  const titleAfterLatinPrefix = normalizedTitle.slice(latinPrefix.length);
 
-  if (latinPrefix && !isGenericRootName(latinPrefix)) return latinPrefix;
+  if (
+    latinPrefix &&
+    !isGenericRootName(latinPrefix) &&
+    (!titleAfterLatinPrefix || /^[\s:/\\|_-]/u.test(titleAfterLatinPrefix))
+  ) {
+    return latinPrefix;
+  }
+
+  const rolePrefix = normalizedTitle.match(/^(.+?)(?:术语|基本概念|应用步骤|具体代码|问题排查)(?:\s|$)/u)?.[1]?.trim();
+  if (rolePrefix && rolePrefix.length >= 2 && !isGenericRootName(rolePrefix)) return rolePrefix;
 
   const beforeSeparator = normalizedTitle.split(/[：:|/\\]/u)[0]?.trim() ?? "";
   const candidate = beforeSeparator
@@ -1701,6 +2271,13 @@ function isSupportedPathSegment(
   const semanticText = normalizeComparableReference(`${sectionTitle}\n${semanticSourceText}`);
 
   if (semanticText.includes(normalizedSegment)) {
+    return true;
+  }
+
+  const titleBigrams = [...normalizeComparableReference(sectionTitle)]
+    .slice(0, -1)
+    .map((_, index, characters) => characters.slice(index, index + 2).join(""));
+  if (titleBigrams.some((bigram) => bigram.length === 2 && normalizedSegment.includes(bigram))) {
     return true;
   }
 
@@ -2161,6 +2738,22 @@ function readRequiredString(
   }
 
   return value.trim();
+}
+
+function readRequiredInteger(
+  record: Record<string, unknown>,
+  key: string,
+  path: string,
+  errors: ReviewSkillValidationError[],
+) {
+  const value = record[key];
+
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    errors.push({ path, message: "字段必须是大于 0 的整数。" });
+    return 0;
+  }
+
+  return value;
 }
 
 function readOptionalString(record: Record<string, unknown>, key: string) {

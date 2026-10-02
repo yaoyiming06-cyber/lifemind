@@ -4,7 +4,7 @@ LifeMind 是一款面向 Obsidian 知识库的桌面整理工具。它把文本�
 
 ## 功能
 
-- 导入学习材料，提取文本；PDF 可结合 macOS Vision OCR 识别页面内容。
+- 导入学习材料，提取文本；PDF 会独立渲染页面图像供视觉模型复核，正式审理不运行 OCR。
 - 使用 DeepSeek 结构化审理材料，并在本地校验生成结果。
 - 在写入前预览笔记、目录和关系；确认后才修改真实 Vault。
 - 记录批次写入信息，支持撤销已确认的批次。
@@ -18,7 +18,7 @@ LifeMind 会把模型输出当作候选结果，而不是直接写入指令。�
 - React、TypeScript、Vite 和 esbuild
 - Tauri 2 与 Rust
 - DeepSeek Chat Completions 兼容接口
-- macOS Vision PDF OCR 与系统钥匙串
+- macOS PDFKit 页面渲染、系统钥匙串
 
 当前项目以 macOS 桌面版为主。
 

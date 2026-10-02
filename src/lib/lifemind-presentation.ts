@@ -15,6 +15,7 @@ const ANNOTATION_CLOSING_BRACKETS = new Map([
 export function formatKnowledgeMarkdown(markdown: string): string {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   let fenceCharacter: "`" | "~" | null = null;
+  let mathBlock = false;
 
   return lines
     .map((line) => {
@@ -27,6 +28,12 @@ export function formatKnowledgeMarkdown(markdown: string): string {
       }
 
       if (fenceCharacter) return line;
+      const mathBlockDelimiterCount = (line.match(/\$\$/gu) ?? []).length;
+      if (mathBlockDelimiterCount > 0) {
+        if (mathBlockDelimiterCount % 2 === 1) mathBlock = !mathBlock;
+        return line;
+      }
+      if (mathBlock) return normalizeFormulaExpression(line);
 
       return formatKnowledgeLine(line);
     })
@@ -39,7 +46,71 @@ function formatKnowledgeLine(line: string) {
   const diagram = parseStepDiagram(line);
   if (diagram) return renderStepDiagram(diagram);
 
-  return formatTitleContentBullet(line);
+  return formatTitleContentBullet(formatFormulaLine(line));
+}
+
+function formatFormulaLine(line: string) {
+  if (line.includes("$$") || /(?:^|\s)where\s/iu.test(line)) return line;
+
+  const tokens = line.split(/(\$\$[\s\S]*?\$\$|\$[^$\n]*\$|<[^>]*>)/gu);
+
+  return tokens
+    .map((token, index) => {
+      const isProtected = index % 2 === 1;
+      return isProtected ? token : wrapBareFormulaSegments(token);
+    })
+    .join("");
+}
+
+const BARE_FORMULA_PATTERN = /(?<![\w$])([A-Za-zα-ωΑ-Ω](?:[A-Za-z0-9_α-ωΑ-Ω]*)(?:(?:\([^()\n]*\)|\[[^\[\]\n]*\]))*\s*=\s*[^$，。；;：:\n!?！？?]+?)(?=\s*(?:[，。；;：:\n!?！？?]|$))/gu;
+
+function wrapBareFormulaSegments(text: string) {
+  return text.replace(BARE_FORMULA_PATTERN, (match) => {
+    const rawFormula = match.trim();
+    const sentencePunctuation = rawFormula.endsWith(".") ? "." : "";
+    const formula = sentencePunctuation ? rawFormula.slice(0, -1).trimEnd() : rawFormula;
+
+    if (!isBareFormulaCandidate(formula)) return match;
+
+    const leadingWhitespace = match.match(/^\s*/u)?.[0] ?? "";
+    const trailingWhitespace = match.match(/\s*$/u)?.[0] ?? "";
+    const normalized = normalizeFormulaExpression(formula);
+
+    return `${leadingWhitespace}$${normalized}$${sentencePunctuation}${trailingWhitespace}`;
+  });
+}
+
+function isBareFormulaCandidate(formula: string) {
+  if (!formula.includes("=")) return false;
+  if (/[<>]|=>|->|\b(?:select|from|return|const|let|var)\b/iu.test(formula)) return false;
+  if (!/[A-Za-zα-ωΑ-Ω](?:[A-Za-z0-9_α-ωΑ-Ω]*)(?:\([^()\n]*\)|\[[^\[\]\n]*\])?/u.test(formula)) return false;
+
+  return /[A-Za-z0-9][A-Za-z0-9_\s()[\]{}+*/^|.,\\-]|[Σ∑∫α-ωΑ-Ω]/u.test(formula);
+}
+
+export function normalizeFormulaExpression(value: string) {
+  return value
+    .replace(/[−–—]/gu, "-")
+    .replace(/[Σ∑]/gu, "\\sum")
+    .replace(/[∫]/gu, "\\int")
+    .replace(/α/gu, "\\alpha")
+    .replace(/β/gu, "\\beta")
+    .replace(/γ/gu, "\\gamma")
+    .replace(/δ/gu, "\\delta")
+    .replace(/ε/gu, "\\epsilon")
+    .replace(/θ/gu, "\\theta")
+    .replace(/λ/gu, "\\lambda")
+    .replace(/μ/gu, "\\mu")
+    .replace(/σ/gu, "\\sigma")
+    .replace(/τ/gu, "\\tau")
+    .replace(/φ/gu, "\\phi")
+    .replace(/ω/gu, "\\omega")
+    .replace(/Ω/gu, "\\Omega")
+    .replace(/π/gu, "\\pi")
+    .replace(/∞/gu, "\\infty")
+    .replace(/²/gu, "^2")
+    .replace(/³/gu, "^3")
+    .trim();
 }
 
 function parseStepDiagram(line: string) {
@@ -192,7 +263,17 @@ function formatTitleContentBullet(line: string) {
   const content = match[2];
   const colonIndexes = findTopLevelColonIndexes(content);
 
-  if (colonIndexes.length !== 1) return line;
+  if (colonIndexes.length !== 1) {
+    if (!line.includes("$") || colonIndexes.length > 1) return line;
+
+    const formulaIndex = content.indexOf("$");
+    const labelEnd = content.lastIndexOf("，", formulaIndex);
+    if (formulaIndex < 0 || labelEnd <= 0) return line;
+
+    const label = content.slice(0, labelEnd + 1).trim();
+    const body = content.slice(labelEnd + 1);
+    return `${prefix}${renderTitleLabel(label)}${body}`;
+  }
 
   const colonIndex = colonIndexes[0];
   const title = content.slice(0, colonIndex).trim();
@@ -201,7 +282,18 @@ function formatTitleContentBullet(line: string) {
 
   if (!title || !body) return line;
 
-  return `${prefix}<span class="lifemind-label" style="font-size: 1.08em; font-weight: 700;">${escapeHtml(`${title}${content[colonIndex]}`)}</span>${rawBody}`;
+  return `${prefix}${renderTitleLabel(`${title}${content[colonIndex]}`)}${rawBody}`;
+}
+
+function renderTitleLabel(value: string) {
+  return value
+    .split(/(\$\$[\s\S]*?\$\$|\$[^$\n]*\$)/gu)
+    .map((part, index) => {
+      if (!part) return "";
+      if (index % 2 === 1) return part;
+      return `<span class="lifemind-label" style="font-size: 1.08em; font-weight: 700;">${escapeHtml(part)}</span>`;
+    })
+    .join("");
 }
 
 function findTopLevelColonIndexes(value: string) {

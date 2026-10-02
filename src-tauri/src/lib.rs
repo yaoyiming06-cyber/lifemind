@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,6 +19,8 @@ use tauri::Manager;
 struct PreviewFilePayload {
     path: String,
     content: String,
+    #[serde(default)]
+    binary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +30,8 @@ struct VaultWriteFilePayload {
     content: String,
     note_id: String,
     title: String,
+    #[serde(default)]
+    binary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +247,12 @@ struct ExtractedContent {
     title: String,
     content: String,
     source_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf_evidence: Option<PdfEvidenceResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf_quality_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf_text_layer_low_quality: Option<bool>,
 }
 
 const MODEL_ACCEPT_ENCODING: &str = "identity";
@@ -263,17 +274,88 @@ struct PdfTextPage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg(test)]
 struct PdfOcrDocument {
     pages: Vec<PdfOcrPage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PdfOcrPage {
-    page: usize,
-    lines: Vec<PdfOcrLine>,
+struct PdfRenderedDocument {
+    pages: Vec<PdfRenderedPage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfRenderedPage {
+    page: usize,
+    image_width: u32,
+    image_height: u32,
+    image_data_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg(test)]
+#[allow(dead_code)]
+struct PdfOcrPage {
+    page: usize,
+    lines: Vec<PdfOcrLine>,
+    #[serde(default)]
+    image_width: u32,
+    #[serde(default)]
+    image_height: u32,
+    #[serde(default)]
+    image_data_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfEvidenceResponse {
+    pages: Vec<PdfEvidencePageResponse>,
+    images: Vec<PdfEmbeddedImageResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfEmbeddedImageResponse {
+    asset_id: String,
+    page: usize,
+    image_width: u32,
+    image_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    image_data_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfEvidencePageResponse {
+    page: usize,
+    image_width: u32,
+    image_height: u32,
+    image_review_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_data_url: Option<String>,
+    evidence: Vec<PdfEvidenceLineResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfEvidenceLineResponse {
+    id: String,
+    text: String,
+    source: String,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    confidence: f32,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg(test)]
 struct PdfOcrLine {
     text: String,
     x: f32,
@@ -284,6 +366,7 @@ struct PdfOcrLine {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PdfOcrBlock {
     page: usize,
     lines: Vec<String>,
@@ -292,12 +375,14 @@ struct PdfOcrBlock {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PdfOcrEvidenceLine {
     selected: PdfOcrLine,
     candidates: Vec<PdfOcrCandidateEvidence>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PdfOcrCandidateEvidence {
     original: String,
     corrected: String,
@@ -324,7 +409,7 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +607,9 @@ fn extract_text_file_from_path(path: String) -> Result<ExtractedContent, String>
         title: strip_extension(&file_name),
         content,
         source_type: source_type.to_string(),
+        pdf_evidence: None,
+        pdf_quality_source: None,
+        pdf_text_layer_low_quality: None,
     })
 }
 
@@ -534,17 +622,18 @@ fn extract_pdf_content(file_name: &str, bytes: &[u8]) -> Result<ExtractedContent
     let title = strip_extension(file_name);
     let text_layer_result = extract_pdf_text_layer(bytes, file_name);
     let text_layer = text_layer_result.as_deref().unwrap_or_default();
-    let should_attempt_ocr = text_layer.is_empty() || should_attempt_pdf_ocr(&text_layer);
-    let ocr_result = if should_attempt_ocr {
-        extract_pdf_ocr_with_vision(bytes, file_name).map(Some)
-    } else {
-        Ok(None)
-    };
-    let ocr = ocr_result.as_ref().ok().and_then(|value| value.as_ref());
-    let content = build_pdf_extracted_content(&title, &text_layer, ocr);
+    let rendered_result = extract_pdf_page_rendering(bytes, file_name);
+    let rendered = rendered_result.as_ref().ok();
+    let has_rendered_images = rendered.is_some_and(|document| {
+        document
+            .pages
+            .iter()
+            .any(|page| page.image_data_url.is_some())
+    });
+    let content = build_pdf_review_content(&title, text_layer, has_rendered_images);
 
     if content.is_empty() {
-        let details = [text_layer_result.err(), ocr_result.err()]
+        let details = [text_layer_result.err(), rendered_result.err()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -558,10 +647,16 @@ fn extract_pdf_content(file_name: &str, bytes: &[u8]) -> Result<ExtractedContent
         return Err(format!("PDF 未提取到可审理文本，{suffix}"));
     }
 
+    let mut pdf_evidence = build_pdf_page_evidence_from_text_layer(&text_layer, rendered);
+    pdf_evidence.images = extract_pdf_embedded_images(bytes);
+
     Ok(ExtractedContent {
         title,
         content,
         source_type: "pdf".to_string(),
+        pdf_evidence: Some(pdf_evidence),
+        pdf_quality_source: Some(text_layer.to_string()),
+        pdf_text_layer_low_quality: Some(is_low_quality_pdf_text_layer(text_layer)),
     })
 }
 
@@ -878,6 +973,7 @@ fn call_deepseek_chat_model(
     Ok(ReviewModelInvocation { output, usage })
 }
 
+#[cfg(test)]
 fn build_chat_completion_request(
     model: &str,
     system_prompt: &str,
@@ -904,9 +1000,28 @@ fn build_chat_completion_request_with_max_output_tokens(
     _requested_reasoning_effort: Option<&str>,
     tool: Option<&serde_json::Value>,
 ) -> Result<ChatCompletionRequest, String> {
-    let request_text = serde_json::to_string(request)
-        .map_err(|error| format!("无法序列化 Skill 请求：{error}"))?;
+    let content = build_model_user_content(request)?;
 
+    build_chat_completion_request_with_content(
+        model,
+        system_prompt,
+        request,
+        max_output_tokens,
+        _requested_reasoning_effort,
+        tool,
+        content,
+    )
+}
+
+fn build_chat_completion_request_with_content(
+    model: &str,
+    system_prompt: &str,
+    _request: &serde_json::Value,
+    max_output_tokens: Option<u32>,
+    _requested_reasoning_effort: Option<&str>,
+    tool: Option<&serde_json::Value>,
+    content: serde_json::Value,
+) -> Result<ChatCompletionRequest, String> {
     Ok(ChatCompletionRequest {
         model: model.to_string(),
         max_tokens: max_output_tokens
@@ -916,11 +1031,11 @@ fn build_chat_completion_request_with_max_output_tokens(
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: system_prompt.to_string(),
+                content: serde_json::Value::String(system_prompt.to_string()),
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: request_text,
+                content,
             },
         ],
         thinking: Some(serde_json::json!({ "type": "disabled" })),
@@ -938,6 +1053,138 @@ fn build_chat_completion_request_with_max_output_tokens(
                 })
         }),
     })
+}
+
+fn build_model_user_content(request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut text_request = request.clone();
+    let images = text_request
+        .as_object_mut()
+        .and_then(|object| object.remove("pdfEvidenceImages"))
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    let mut page_image_count = 0;
+    let mut embedded_image_count = 0;
+    let selected_images = images
+        .as_array()
+        .ok_or_else(|| "pdfEvidenceImages 必须是数组。".to_string())?
+        .iter()
+        .filter(|item| {
+            let kind = item.get("kind").and_then(serde_json::Value::as_str);
+            let url = item
+                .get("imageDataUrl")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            let metadata_exists = item
+                .get("sourceId")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && item
+                    .get("page")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                && item
+                    .get("assetId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some();
+            if !metadata_exists || !is_allowed_pdf_image_data_url(url) {
+                return false;
+            }
+            match kind {
+                Some("page") if page_image_count < 8 => {
+                    page_image_count += 1;
+                    true
+                }
+                Some("embedded") if embedded_image_count < 8 => {
+                    embedded_image_count += 1;
+                    true
+                }
+                _ => false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let image_items = selected_images
+        .iter()
+        .filter_map(|item| {
+            let url = item.get("imageDataUrl")?.as_str()?.trim();
+            Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            }))
+        })
+        .collect::<Vec<_>>();
+    let request_text = serde_json::to_string(&text_request)
+        .map_err(|error| format!("无法序列化 Skill 请求：{error}"))?;
+
+    if image_items.is_empty() {
+        return Ok(serde_json::Value::String(request_text));
+    }
+
+    let image_context = selected_images
+        .iter()
+        .filter_map(|item| {
+            let source_id = item.get("sourceId")?.as_str()?;
+            let page = item.get("page")?.as_u64()?;
+            let asset_id = item.get("assetId")?.as_str()?;
+            let kind = item.get("kind")?.as_str()?;
+            let kind_label = if kind == "embedded" {
+                "PDF 内嵌图片"
+            } else {
+                "PDF 页面渲染图（仅供审理）"
+            };
+            let position = if kind == "embedded" {
+                let coordinate = |key: &str| {
+                    item.get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                };
+                format!(
+                    "，位置 x={}、y={}、width={}、height={}",
+                    coordinate("x"),
+                    coordinate("y"),
+                    coordinate("width"),
+                    coordinate("height")
+                )
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "{kind_label}：资产 {asset_id}，来源 {source_id}，第 {page} 页{position}。"
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": format!("{request_text}\n\n{image_context}"),
+    })];
+    blocks.extend(image_items);
+
+    Ok(serde_json::Value::Array(blocks))
+}
+
+fn is_allowed_pdf_image_data_url(value: &str) -> bool {
+    value.len() <= 6_000_000
+        && (value.starts_with("data:image/jpeg;base64,")
+            || value.starts_with("data:image/jpg;base64,")
+            || value.starts_with("data:image/png;base64,"))
+        && value[value.find(',').unwrap_or(value.len()) + 1..]
+            .chars()
+            .all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+            })
+}
+
+fn decode_image_data_url(value: &str) -> Result<Vec<u8>, String> {
+    if !is_allowed_pdf_image_data_url(value) {
+        return Err("PDF 图片资产不是有效的受支持 data URL。".to_string());
+    }
+    let (_, encoded) = value
+        .split_once(',')
+        .ok_or_else(|| "PDF 图片资产缺少 Base64 数据。".to_string())?;
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("PDF 图片资产 Base64 解码失败：{error}"))
 }
 
 #[allow(dead_code)]
@@ -1058,7 +1305,19 @@ fn commit_review_batch_operations(
             })?;
         }
 
-        if let Err(error) = fs::write(&target_path, &file.content) {
+        let content = if file.binary {
+            match decode_image_data_url(&file.content) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = rollback_records(&root_path, &records);
+                    return Err(error);
+                }
+            }
+        } else {
+            file.content.as_bytes().to_vec()
+        };
+
+        if let Err(error) = fs::write(&target_path, content) {
             let _ = rollback_records(&root_path, &records);
             return Err(format!(
                 "无法写入 Obsidian 笔记 {}：{error}",
@@ -1197,6 +1456,7 @@ fn confirm_logic_link_update_files(
             } else {
                 parent_title
             },
+            binary: false,
         });
     }
 
@@ -1377,7 +1637,7 @@ fn inspect_vault_write_operations(
         } else {
             None
         };
-        let existing_preview = if exists {
+        let existing_preview = if exists && !file.binary {
             fs::read_to_string(&target_path)
                 .ok()
                 .map(|content| truncate_for_error(&content.replace('\n', " ")))
@@ -1896,7 +2156,7 @@ fn strip_extension(name: &str) -> String {
         .to_string()
 }
 
-fn should_attempt_pdf_ocr(content: &str) -> bool {
+fn is_low_quality_pdf_text_layer(content: &str) -> bool {
     let trimmed = content.trim();
 
     if trimmed.is_empty() {
@@ -1948,11 +2208,32 @@ fn should_attempt_pdf_ocr(content: &str) -> bool {
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
 
-    ["PI1D", "PIlD", "PIID", "PI口", "err0r", "xrror"]
+    if ["PI1D", "PIlD", "PIID", "PI口", "err0r", "xrror"]
         .iter()
         .any(|alias| compact.contains(alias))
+    {
+        return true;
+    }
+
+    let mathematical_symbols = trimmed
+        .chars()
+        .filter(|character| matches!(*character, 'Ʃ' | '∑' | '∫' | '√' | '≤' | '≥' | '□'))
+        .count();
+    let formula_like_lines = trimmed
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            line.contains('=')
+                && line
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic())
+        })
+        .count();
+
+    mathematical_symbols >= 2 && formula_like_lines >= 2
 }
 
+#[cfg(test)]
 fn correct_ocr_technical_terms(value: &str) -> String {
     let mut text = value.trim().to_string();
 
@@ -2054,6 +2335,7 @@ fn correct_ocr_technical_terms(value: &str) -> String {
     text
 }
 
+#[cfg(test)]
 fn merge_ocr_page_lines(page: &PdfOcrPage) -> Vec<PdfOcrLine> {
     merge_ocr_page_line_candidates(page)
         .into_iter()
@@ -2061,6 +2343,7 @@ fn merge_ocr_page_lines(page: &PdfOcrPage) -> Vec<PdfOcrLine> {
         .collect()
 }
 
+#[cfg(test)]
 fn merge_ocr_page_line_candidates(page: &PdfOcrPage) -> Vec<PdfOcrEvidenceLine> {
     let mut candidates = page
         .lines
@@ -2120,6 +2403,7 @@ fn merge_ocr_page_line_candidates(page: &PdfOcrPage) -> Vec<PdfOcrEvidenceLine> 
     stitch_split_ocr_code_evidence_lines(merged)
 }
 
+#[cfg(test)]
 fn stitch_split_ocr_code_evidence_lines(lines: Vec<PdfOcrEvidenceLine>) -> Vec<PdfOcrEvidenceLine> {
     let mut stitched = Vec::new();
     let mut index = 0;
@@ -2162,6 +2446,7 @@ fn stitch_split_ocr_code_evidence_lines(lines: Vec<PdfOcrEvidenceLine>) -> Vec<P
     stitched
 }
 
+#[cfg(test)]
 fn is_standalone_hal_gpio_prefix(text: &str) -> bool {
     matches!(
         text.trim(),
@@ -2169,6 +2454,7 @@ fn is_standalone_hal_gpio_prefix(text: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_hal_gpio_function_line(text: &str) -> bool {
     let trimmed = text.trim();
     [
@@ -2181,6 +2467,7 @@ fn is_hal_gpio_function_line(text: &str) -> bool {
     .any(|prefix| trimmed.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn ocr_lines_are_vertically_adjacent(top: &PdfOcrLine, bottom: &PdfOcrLine) -> bool {
     let vertical_gap = (top.y - bottom.y).abs();
     let horizontal_drift = (top.x - bottom.x).abs();
@@ -2188,6 +2475,7 @@ fn ocr_lines_are_vertically_adjacent(top: &PdfOcrLine, bottom: &PdfOcrLine) -> b
     vertical_gap <= 0.075 && horizontal_drift <= 0.18
 }
 
+#[cfg(test)]
 fn meaningful_ocr_candidate_lines(page: &PdfOcrPage) -> Vec<PdfOcrEvidenceLine> {
     merge_ocr_page_line_candidates(page)
         .into_iter()
@@ -2195,6 +2483,7 @@ fn meaningful_ocr_candidate_lines(page: &PdfOcrPage) -> Vec<PdfOcrEvidenceLine> 
         .collect()
 }
 
+#[cfg(test)]
 fn has_ocr_candidate_transmission_value(line: &PdfOcrEvidenceLine) -> bool {
     technical_term_bonus(&line.selected.text) > 0.0
         || suspicious_ocr_penalty(&line.selected.text) > 0.0
@@ -2207,6 +2496,7 @@ fn has_ocr_candidate_transmission_value(line: &PdfOcrEvidenceLine) -> bool {
         })
 }
 
+#[cfg(test)]
 fn format_ocr_candidate_evidence(line: &PdfOcrEvidenceLine) -> String {
     let mut candidates = line.candidates.clone();
     candidates.sort_by(|left, right| {
@@ -2244,6 +2534,7 @@ fn format_ocr_candidate_evidence(line: &PdfOcrEvidenceLine) -> String {
     )
 }
 
+#[cfg(test)]
 fn ocr_lines_share_visual_region(left: &PdfOcrLine, right: &PdfOcrLine) -> bool {
     let y_close = (left.y - right.y).abs() <= 0.028;
     let x_close = (left.x - right.x).abs() <= 0.08;
@@ -2255,11 +2546,13 @@ fn ocr_lines_share_visual_region(left: &PdfOcrLine, right: &PdfOcrLine) -> bool 
     y_close && (x_close || overlap / min_width >= 0.45)
 }
 
+#[cfg(test)]
 fn ocr_line_quality_score(line: &PdfOcrLine) -> f32 {
     line.confidence + technical_term_bonus(&line.text) - suspicious_ocr_penalty(&line.text)
         + (line.text.chars().count().min(80) as f32 * 0.001)
 }
 
+#[cfg(test)]
 fn technical_term_bonus(text: &str) -> f32 {
     let terms = [
         "STM32", "MSPM0", "GPIO", "UART", "USART", "I2C", "SPI", "ADC", "DMA", "PWM", "PID",
@@ -2269,6 +2562,7 @@ fn technical_term_bonus(text: &str) -> f32 {
     terms.iter().filter(|term| text.contains(**term)).count() as f32 * 0.08
 }
 
+#[cfg(test)]
 fn suspicious_ocr_penalty(text: &str) -> f32 {
     let aliases = [
         "GTLO", "GPZD", "GPTO", "GP10", "GPI0", "HAL_CPIO", "PII", "PI7", "PI.D", "PLD", "5TM32",
@@ -2282,6 +2576,7 @@ fn suspicious_ocr_penalty(text: &str) -> f32 {
         * 0.08
 }
 
+#[cfg(test)]
 fn group_ocr_page_blocks(page: &PdfOcrPage) -> Vec<PdfOcrBlock> {
     const BLOCK_GAP_THRESHOLD: f32 = 0.14;
     let mut lines = merge_ocr_page_lines(page);
@@ -2324,6 +2619,7 @@ fn group_ocr_page_blocks(page: &PdfOcrPage) -> Vec<PdfOcrBlock> {
     blocks
 }
 
+#[cfg(test)]
 fn build_pdf_extracted_content(
     title: &str,
     text_layer: &str,
@@ -2331,6 +2627,12 @@ fn build_pdf_extracted_content(
 ) -> String {
     let trimmed_text_layer = text_layer.trim();
     let Some(ocr) = ocr else {
+        if is_low_quality_pdf_text_layer(trimmed_text_layer) {
+            return format!(
+                "【PDF 页面视觉证据】\n来源文件：{}\nPDF 文本层质量不足，已从模型正文中移除；请以请求中附带的原始页面图像为主要审理依据。",
+                title.trim()
+            );
+        }
         return trimmed_text_layer.to_string();
     };
 
@@ -2407,13 +2709,446 @@ fn build_pdf_extracted_content(
 
     if trimmed_text_layer.is_empty() {
         content.push_str("未提取到可用文本层。");
-    } else if should_attempt_pdf_ocr(trimmed_text_layer) {
+    } else if is_low_quality_pdf_text_layer(trimmed_text_layer) {
         content.push_str("低质量 PDF 文本层已省略，避免将重复的乱码或 OCR 噪声再次发送给模型；请以本地 Vision OCR 页面结构和候选证据为准。");
     } else {
         content.push_str(trimmed_text_layer);
     }
 
     content.trim().to_string()
+}
+
+fn build_pdf_review_content(title: &str, text_layer: &str, has_page_images: bool) -> String {
+    let trimmed_text_layer = text_layer.trim();
+
+    if is_low_quality_pdf_text_layer(trimmed_text_layer) {
+        if !has_page_images {
+            return String::new();
+        }
+        return format!(
+            "【PDF 页面视觉证据】\n来源文件：{}\nPDF 文本层质量不足，已从模型正文中移除；请以请求中附带的原始页面图像为主要审理依据。",
+            title.trim()
+        );
+    }
+
+    trimmed_text_layer.to_string()
+}
+
+fn build_pdf_page_evidence_from_text_layer(
+    text_layer: &str,
+    rendered: Option<&PdfRenderedDocument>,
+) -> PdfEvidenceResponse {
+    let pages = if is_low_quality_pdf_text_layer(text_layer) {
+        Vec::new()
+    } else {
+        parse_formatted_pdf_text_pages(text_layer)
+    };
+    PdfEvidenceResponse {
+        pages: build_pdf_page_evidence(&pages, rendered),
+        images: Vec::new(),
+    }
+}
+
+fn parse_formatted_pdf_text_pages(text_layer: &str) -> Vec<PdfTextPage> {
+    let mut pages = Vec::new();
+    let mut current_page: Option<usize> = None;
+    let mut current_lines = Vec::new();
+
+    for line in text_layer.lines() {
+        let trimmed = line.trim();
+        let page_number = trimmed
+            .strip_prefix("## 第 ")
+            .and_then(|value| value.strip_suffix(" 页"))
+            .and_then(|value| value.parse::<usize>().ok());
+
+        if let Some(page) = page_number {
+            if let Some(previous_page) = current_page.take() {
+                pages.push(PdfTextPage {
+                    page: previous_page,
+                    text: current_lines.join("\n"),
+                });
+                current_lines.clear();
+            }
+            current_page = Some(page);
+        } else if current_page.is_some() && !trimmed.is_empty() {
+            current_lines.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(page) = current_page {
+        pages.push(PdfTextPage {
+            page,
+            text: current_lines.join("\n"),
+        });
+    }
+
+    if pages.is_empty() && !text_layer.trim().is_empty() {
+        pages.push(PdfTextPage {
+            page: 1,
+            text: text_layer.trim().to_string(),
+        });
+    }
+
+    pages
+}
+
+fn build_pdf_page_evidence(
+    text_pages: &[PdfTextPage],
+    rendered: Option<&PdfRenderedDocument>,
+) -> Vec<PdfEvidencePageResponse> {
+    let mut page_numbers = BTreeSet::new();
+    page_numbers.extend(text_pages.iter().map(|page| page.page));
+    page_numbers.extend(
+        rendered
+            .into_iter()
+            .flat_map(|document| document.pages.iter().map(|page| page.page)),
+    );
+
+    page_numbers
+        .into_iter()
+        .map(|page_number| {
+            let text_page = text_pages.iter().find(|page| page.page == page_number);
+            let rendered_page = rendered
+                .and_then(|document| document.pages.iter().find(|page| page.page == page_number));
+            let mut evidence = Vec::new();
+
+            if let Some(page) = text_page {
+                for (index, line) in page
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .enumerate()
+                {
+                    evidence.push(PdfEvidenceLineResponse {
+                        id: format!("pdf-page-{page_number}-text-{}", index + 1),
+                        text: line.to_string(),
+                        source: "pdf-text".to_string(),
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.0,
+                        height: 0.0,
+                        confidence: 1.0,
+                        candidates: Vec::new(),
+                    });
+                }
+            }
+
+            PdfEvidencePageResponse {
+                page: page_number,
+                image_width: rendered_page.map(|page| page.image_width).unwrap_or(0),
+                image_height: rendered_page.map(|page| page.image_height).unwrap_or(0),
+                image_review_required: rendered_page
+                    .and_then(|page| page.image_data_url.as_ref())
+                    .is_some(),
+                image_data_url: rendered_page.and_then(|page| page.image_data_url.clone()),
+                evidence,
+            }
+        })
+        .collect()
+}
+
+fn extract_pdf_embedded_images(pdf_bytes: &[u8]) -> Vec<PdfEmbeddedImageResponse> {
+    use lopdf::{content::Content, Document, Object};
+
+    let Ok(document) = Document::load_mem(pdf_bytes) else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+
+    for (page_number, page_id) in document.get_pages() {
+        let Some(page_box) = pdf_page_display_box(&document, page_id) else {
+            continue;
+        };
+        let Some(xobjects) = pdf_page_xobjects(&document, page_id) else {
+            continue;
+        };
+        let Ok(content_bytes) = document.get_page_content(page_id) else {
+            continue;
+        };
+        let Ok(content) = Content::decode(&content_bytes) else {
+            continue;
+        };
+
+        let mut matrix = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let mut matrix_stack = Vec::new();
+        let mut placement_index = 0;
+
+        for operation in content.operations {
+            match operation.operator.as_str() {
+                "q" => matrix_stack.push(matrix),
+                "Q" => {
+                    if let Some(previous) = matrix_stack.pop() {
+                        matrix = previous;
+                    }
+                }
+                "cm" if operation.operands.len() == 6 => {
+                    let Some(transform) = operation
+                        .operands
+                        .iter()
+                        .map(|operand| operand.as_float().ok())
+                        .collect::<Option<Vec<_>>>()
+                        .and_then(|values| <[f32; 6]>::try_from(values).ok())
+                    else {
+                        continue;
+                    };
+                    matrix = multiply_pdf_matrices(matrix, transform);
+                }
+                "Do" => {
+                    let Some(Object::Name(name)) = operation.operands.first() else {
+                        continue;
+                    };
+                    let Some(object) = xobjects.get(name) else {
+                        continue;
+                    };
+                    let Some(stream) = object.as_stream().ok() else {
+                        continue;
+                    };
+                    if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Image")
+                    {
+                        continue;
+                    }
+                    let Some((x, y, width, height)) = normalized_pdf_image_bounds(matrix, page_box)
+                    else {
+                        continue;
+                    };
+                    if is_page_sized_pdf_image(x, y, width, height) {
+                        continue;
+                    }
+                    let Some((image_width, image_height, image_data_url)) =
+                        encode_pdf_image(stream)
+                    else {
+                        continue;
+                    };
+
+                    placement_index += 1;
+                    images.push(PdfEmbeddedImageResponse {
+                        asset_id: format!("pdf-image-page-{page_number}-{placement_index}"),
+                        page: page_number as usize,
+                        image_width,
+                        image_height,
+                        x,
+                        y,
+                        width,
+                        height,
+                        image_data_url,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    images
+}
+
+fn pdf_page_xobjects(
+    document: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> Option<BTreeMap<Vec<u8>, lopdf::Object>> {
+    use lopdf::Object;
+
+    let (direct_resources, inherited_resource_ids) = document.get_page_resources(page_id).ok()?;
+    let mut resources = Vec::new();
+    if let Some(resources_dict) = direct_resources {
+        resources.push(resources_dict);
+    }
+    for resource_id in inherited_resource_ids {
+        if let Ok(resources_dict) = document.get_dictionary(resource_id) {
+            resources.push(resources_dict);
+        }
+    }
+
+    let mut xobjects = BTreeMap::new();
+    for resources_dict in resources {
+        let Ok(xobjects_object) = resources_dict.get_deref(b"XObject", document) else {
+            continue;
+        };
+        let Ok(xobjects_dict) = xobjects_object.as_dict() else {
+            continue;
+        };
+        for (name, value) in xobjects_dict.iter() {
+            let resolved = match value {
+                Object::Reference(id) => document.get_object(*id).ok().cloned(),
+                value => Some(value.clone()),
+            };
+            if let Some(object) = resolved {
+                xobjects.entry(name.clone()).or_insert(object);
+            }
+        }
+    }
+    Some(xobjects)
+}
+
+fn pdf_page_display_box(document: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<[f32; 4]> {
+    use lopdf::Object;
+
+    let mut current_id = Some(page_id);
+    while let Some(id) = current_id {
+        let dictionary = document.get_dictionary(id).ok()?;
+        for key in [b"CropBox" as &[u8], b"MediaBox"] {
+            let Ok(value) = dictionary.get(key) else {
+                continue;
+            };
+            let value = match value {
+                Object::Reference(reference) => document.get_object(*reference).ok()?,
+                value => value,
+            };
+            let values = value
+                .as_array()
+                .ok()?
+                .iter()
+                .map(|coordinate| coordinate.as_float().ok())
+                .collect::<Option<Vec<_>>>()?;
+            let [left, bottom, right, top] = <[f32; 4]>::try_from(values).ok()?;
+            if right > left && top > bottom {
+                return Some([left, bottom, right, top]);
+            }
+        }
+        current_id = dictionary
+            .get(b"Parent")
+            .ok()
+            .and_then(|parent| parent.as_reference().ok());
+    }
+    None
+}
+
+fn encode_pdf_image(stream: &lopdf::Stream) -> Option<(u32, u32, String)> {
+    use lopdf::Object;
+
+    let image_width = u32::try_from(stream.dict.get(b"Width").ok()?.as_i64().ok()?).ok()?;
+    let image_height = u32::try_from(stream.dict.get(b"Height").ok()?.as_i64().ok()?).ok()?;
+    if image_width == 0 || image_height == 0 || image_width > 10_000 || image_height > 10_000 {
+        return None;
+    }
+
+    let filters = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => vec![name.as_slice()],
+        Ok(Object::Array(filters)) => filters
+            .iter()
+            .map(Object::as_name)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?,
+        _ => Vec::new(),
+    };
+    if filters.as_slice() == [b"DCTDecode"] {
+        return Some((
+            image_width,
+            image_height,
+            format!(
+                "data:image/jpeg;base64,{}",
+                BASE64_STANDARD.encode(&stream.content)
+            ),
+        ));
+    }
+    if filters.iter().any(|filter| *filter == b"DCTDecode") {
+        return None;
+    }
+
+    let bits_per_component = stream
+        .dict
+        .get(b"BitsPerComponent")
+        .and_then(Object::as_i64)
+        .ok()?;
+    if bits_per_component != 8 {
+        return None;
+    }
+    if stream
+        .dict
+        .get(b"DecodeParms")
+        .and_then(Object::as_dict)
+        .and_then(|params| params.get(b"Predictor"))
+        .and_then(Object::as_i64)
+        .is_ok_and(|predictor| predictor > 1)
+    {
+        return None;
+    }
+
+    let color_space = stream.dict.get(b"ColorSpace").ok()?.as_name().ok()?;
+    let (channels, color_type) = match color_space {
+        b"DeviceRGB" => (3_u32, png::ColorType::Rgb),
+        b"DeviceGray" => (1_u32, png::ColorType::Grayscale),
+        _ => return None,
+    };
+    let expected_length = image_width
+        .checked_mul(image_height)?
+        .checked_mul(channels)? as usize;
+    if expected_length > 64 * 1024 * 1024 {
+        return None;
+    }
+    let pixels = stream.decompressed_content().ok()?;
+    if pixels.len() != expected_length {
+        return None;
+    }
+
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, image_width, image_height);
+        encoder.set_color(color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&pixels).ok()?;
+    }
+    Some((
+        image_width,
+        image_height,
+        format!("data:image/png;base64,{}", BASE64_STANDARD.encode(encoded)),
+    ))
+}
+
+fn multiply_pdf_matrices(left: [f32; 6], right: [f32; 6]) -> [f32; 6] {
+    [
+        left[0] * right[0] + left[2] * right[1],
+        left[1] * right[0] + left[3] * right[1],
+        left[0] * right[2] + left[2] * right[3],
+        left[1] * right[2] + left[3] * right[3],
+        left[0] * right[4] + left[2] * right[5] + left[4],
+        left[1] * right[4] + left[3] * right[5] + left[5],
+    ]
+}
+
+fn normalized_pdf_image_bounds(
+    matrix: [f32; 6],
+    page_box: [f32; 4],
+) -> Option<(f32, f32, f32, f32)> {
+    let [left, bottom, right, top] = page_box;
+    let page_width = right - left;
+    let page_height = top - bottom;
+    if page_width <= 0.0 || page_height <= 0.0 {
+        return None;
+    }
+
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| {
+        (
+            matrix[0] * x + matrix[2] * y + matrix[4],
+            matrix[1] * x + matrix[3] * y + matrix[5],
+        )
+    });
+    let min_x = corners
+        .iter()
+        .map(|corner| corner.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|corner| corner.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners
+        .iter()
+        .map(|corner| corner.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|corner| corner.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let x = ((min_x - left) / page_width).clamp(0.0, 1.0);
+    let y = ((top - max_y) / page_height).clamp(0.0, 1.0);
+    let width = ((max_x - min_x) / page_width).clamp(0.0, 1.0);
+    let height = ((max_y - min_y) / page_height).clamp(0.0, 1.0);
+    (width > 0.0 && height > 0.0).then_some((x, y, width, height))
+}
+
+fn is_page_sized_pdf_image(x: f32, y: f32, width: f32, height: f32) -> bool {
+    x <= 0.03 && y <= 0.03 && x + width >= 0.97 && y + height >= 0.97
 }
 
 #[cfg(target_os = "macos")]
@@ -2503,6 +3238,74 @@ fn run_swift_pdf_text_helper(
 }
 
 #[cfg(target_os = "macos")]
+fn extract_pdf_page_rendering(
+    pdf_bytes: &[u8],
+    _file_name: &str,
+) -> Result<PdfRenderedDocument, String> {
+    let temp_root = std::env::temp_dir().join(format!(
+        "lifemind-pdf-render-{}-{}",
+        std::process::id(),
+        unix_timestamp_millis()
+    ));
+    let result = (|| {
+        fs::create_dir_all(&temp_root)
+            .map_err(|error| format!("无法创建 PDF 页面渲染临时目录：{error}"))?;
+        let input_path = temp_root.join("input.pdf");
+        let script_path = temp_root.join("lifemind_pdf_render.swift");
+        let output_path = temp_root.join("pages.json");
+
+        fs::write(&input_path, pdf_bytes)
+            .map_err(|error| format!("无法写入 PDF 页面渲染临时 PDF：{error}"))?;
+        fs::write(&script_path, PDF_PAGE_RENDER_SWIFT_SCRIPT)
+            .map_err(|error| format!("无法写入 PDF 页面渲染 Swift 脚本：{error}"))?;
+
+        run_swift_pdf_render_helper(&script_path, &input_path, &output_path)?;
+
+        let json = fs::read_to_string(&output_path)
+            .map_err(|error| format!("无法读取 PDF 页面渲染输出：{error}"))?;
+        serde_json::from_str(&json).map_err(|error| format!("无法解析 PDF 页面渲染 JSON：{error}"))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_pdf_page_rendering(
+    _pdf_bytes: &[u8],
+    _file_name: &str,
+) -> Result<PdfRenderedDocument, String> {
+    Err("PDF 页面视觉渲染仅支持 macOS。".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn run_swift_pdf_render_helper(
+    script_path: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new("/usr/bin/swift");
+    command
+        .arg(script_path)
+        .arg(input_path)
+        .arg(output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = run_command_with_timeout(command, Duration::from_secs(120), "PDF 页面视觉渲染")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "PDF 页面视觉渲染失败，退出码：{}；{}",
+        output.status,
+        truncate_for_error(stderr.trim())
+    ))
+}
+
+#[cfg(all(test, target_os = "macos"))]
 fn extract_pdf_ocr_with_vision(
     pdf_bytes: &[u8],
     _file_name: &str,
@@ -2535,15 +3338,7 @@ fn extract_pdf_ocr_with_vision(
     result
 }
 
-#[cfg(not(target_os = "macos"))]
-fn extract_pdf_ocr_with_vision(
-    _pdf_bytes: &[u8],
-    _file_name: &str,
-) -> Result<PdfOcrDocument, String> {
-    Err("本地 Vision OCR 仅支持 macOS。".to_string())
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn run_swift_ocr_helper(
     script_path: &Path,
     input_path: &Path,
@@ -2652,6 +3447,88 @@ try data.write(to: outputURL)
 "#;
 
 #[cfg(target_os = "macos")]
+const PDF_PAGE_RENDER_SWIFT_SCRIPT: &str = r#"
+import AppKit
+import Foundation
+import PDFKit
+
+struct RenderedPage: Codable {
+    let page: Int
+    let imageWidth: Int
+    let imageHeight: Int
+    let imageDataUrl: String?
+}
+
+struct RenderedDocument: Codable {
+    let pages: [RenderedPage]
+}
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
+}
+
+if CommandLine.arguments.count < 3 {
+    fail("usage: lifemind_pdf_render.swift input.pdf output.json")
+}
+
+let inputURL = URL(fileURLWithPath: CommandLine.arguments[1])
+let outputURL = URL(fileURLWithPath: CommandLine.arguments[2])
+
+guard let document = PDFDocument(url: inputURL) else {
+    fail("cannot open PDF")
+}
+
+func renderPage(_ page: PDFPage, scale: CGFloat) -> CGImage? {
+    let bounds = page.bounds(for: .mediaBox)
+    let imageSize = NSSize(width: bounds.width * scale, height: bounds.height * scale)
+    let image = NSImage(size: imageSize)
+    image.lockFocus()
+    NSColor.white.setFill()
+    NSBezierPath(rect: NSRect(origin: .zero, size: imageSize)).fill()
+    if let context = NSGraphicsContext.current?.cgContext {
+        context.saveGState()
+        context.scaleBy(x: scale, y: scale)
+        page.draw(with: .mediaBox, to: context)
+        context.restoreGState()
+    }
+    image.unlockFocus()
+    guard let tiff = image.tiffRepresentation,
+          let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
+    return bitmap.cgImage
+}
+
+func jpegDataUrl(_ image: CGImage) -> String? {
+    let representation = NSBitmapImageRep(cgImage: image)
+    guard let data = representation.representation(using: .jpeg, properties: [.compressionFactor: 0.62]) else {
+        return nil
+    }
+    let encoded = data.base64EncodedString()
+    guard encoded.count <= 6_000_000 else { return nil }
+    return "data:image/jpeg;base64," + encoded
+}
+
+let maxPages = min(document.pageCount, 80)
+var pages: [RenderedPage] = []
+for index in 0..<maxPages {
+    guard let page = document.page(at: index),
+          let image = renderPage(page, scale: 1.6) else {
+        pages.append(RenderedPage(page: index + 1, imageWidth: 0, imageHeight: 0, imageDataUrl: nil))
+        continue
+    }
+    pages.append(RenderedPage(
+        page: index + 1,
+        imageWidth: image.width,
+        imageHeight: image.height,
+        imageDataUrl: jpegDataUrl(image)
+    ))
+}
+
+let data = try JSONEncoder().encode(RenderedDocument(pages: pages))
+try data.write(to: outputURL)
+"#;
+
+#[cfg(all(test, target_os = "macos"))]
 const VISION_OCR_SWIFT_SCRIPT: &str = r#"
 import AppKit
 import CoreImage
@@ -2671,6 +3548,9 @@ struct OcrLine: Codable {
 struct OcrPage: Codable {
     let page: Int
     let lines: [OcrLine]
+    let imageWidth: Int
+    let imageHeight: Int
+    let imageDataUrl: String?
 }
 
 struct OcrDocument: Codable {
@@ -2760,6 +3640,20 @@ func sharpenForHandwriting(_ image: CGImage) -> CGImage {
     return sharpened
 }
 
+func jpegDataURL(_ image: CGImage) -> String? {
+    let representation = NSBitmapImageRep(cgImage: image)
+    guard let data = representation.representation(
+        using: .jpeg,
+        properties: [.compressionFactor: 0.62]
+    ) else {
+        return nil
+    }
+
+    let encoded = data.base64EncodedString()
+    guard encoded.count <= 6_000_000 else { return nil }
+    return "data:image/jpeg;base64," + encoded
+}
+
 func ocrImageVariants(_ image: CGImage) -> [CGImage] {
     let enhanced = colorControlForHandwriting(image, contrast: 1.28, brightness: 0.02)
     let highContrast = colorControlForHandwriting(image, contrast: 1.62, brightness: 0.04)
@@ -2818,7 +3712,7 @@ let maxPages = min(document.pageCount, 40)
 for index in 0..<maxPages {
     guard let page = document.page(at: index),
           let image = renderPage(page, scale: 2.8) else {
-        pages.append(OcrPage(page: index + 1, lines: []))
+        pages.append(OcrPage(page: index + 1, lines: [], imageWidth: 0, imageHeight: 0, imageDataUrl: nil))
         continue
     }
 
@@ -2833,9 +3727,23 @@ for index in 0..<maxPages {
             }
         }
 
-        pages.append(OcrPage(page: index + 1, lines: lines))
+        let preview = renderPage(page, scale: 1.6)
+        pages.append(OcrPage(
+            page: index + 1,
+            lines: lines,
+            imageWidth: preview?.width ?? image.width,
+            imageHeight: preview?.height ?? image.height,
+            imageDataUrl: preview.flatMap(jpegDataURL)
+        ))
     } catch {
-        pages.append(OcrPage(page: index + 1, lines: []))
+        let preview = renderPage(page, scale: 1.6)
+        pages.append(OcrPage(
+            page: index + 1,
+            lines: [],
+            imageWidth: preview?.width ?? image.width,
+            imageHeight: preview?.height ?? image.height,
+            imageDataUrl: preview.flatMap(jpegDataURL)
+        ))
     }
 }
 
@@ -2885,6 +3793,9 @@ fn extract_webpage(url: &str) -> Result<ExtractedContent, String> {
         title,
         content,
         source_type: "web".to_string(),
+        pdf_evidence: None,
+        pdf_quality_source: None,
+        pdf_text_layer_low_quality: None,
     })
 }
 
@@ -3261,7 +4172,12 @@ fn write_preview_files(root: &str, files: &[PreviewFilePayload]) -> Result<(), S
             fs::create_dir_all(parent).map_err(|error| format!("无法创建预览文件夹：{error}"))?;
         }
 
-        fs::write(&target_path, &file.content).map_err(|error| {
+        let content = if file.binary {
+            decode_image_data_url(&file.content)?
+        } else {
+            file.content.as_bytes().to_vec()
+        };
+        fs::write(&target_path, content).map_err(|error| {
             format!(
                 "无法写入 Obsidian 预览文件 {}：{error}",
                 target_path.to_string_lossy()
@@ -3987,6 +4903,255 @@ mod tests {
     }
 
     #[test]
+    fn serializes_multimodal_user_content_for_deepseek_flash() {
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": { "name": "submit_review_plan" }
+        });
+        let content = serde_json::json!([
+            { "type": "text", "text": "第 2 页证据 pdf-page-2-ocr-1" },
+            { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,aW1hZ2U=" } }
+        ]);
+        let request = build_chat_completion_request_with_content(
+            "deepseek-flash",
+            "system",
+            &serde_json::json!({}),
+            Some(10_000),
+            None,
+            Some(&tool),
+            content,
+        )
+        .unwrap();
+        let payload = serde_json::to_value(request).unwrap();
+
+        assert_eq!(payload["model"], "deepseek-flash");
+        assert_eq!(payload["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            payload["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,aW1hZ2U="
+        );
+        assert_eq!(
+            payload["thinking"],
+            serde_json::json!({ "type": "disabled" })
+        );
+        assert_eq!(
+            payload["tool_choice"]["function"]["name"],
+            "submit_review_plan"
+        );
+    }
+
+    #[test]
+    fn sends_page_and_embedded_pdf_images_with_matching_metadata() {
+        let images = (0..16)
+            .map(|index| {
+                serde_json::json!({
+                    "sourceId": "src-pdf",
+                    "page": index / 8 + 1,
+                    "assetId": format!("pdf-asset-{index}"),
+                    "kind": if index < 8 { "page" } else { "embedded" },
+                    "x": 0.125,
+                    "y": 0.25,
+                    "width": 0.5,
+                    "height": 0.25,
+                    "imageDataUrl": "data:image/png;base64,aW1hZ2U=",
+                })
+            })
+            .collect::<Vec<_>>();
+        let content =
+            build_model_user_content(&serde_json::json!({ "pdfEvidenceImages": images })).unwrap();
+        let blocks = content.as_array().unwrap();
+        let request_context = blocks[0]["text"].as_str().unwrap();
+
+        assert_eq!(blocks.len(), 17);
+        assert!(request_context.contains("pdf-asset-8"));
+        assert!(request_context.contains("PDF 内嵌图片"));
+        assert!(request_context.contains("x=0.125"));
+        assert!(request_context.contains("y=0.25"));
+        assert!(request_context.contains("width=0.5"));
+        assert!(request_context.contains("height=0.25"));
+        assert_eq!(
+            blocks[9]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn assigns_normalized_stable_ids_to_pdf_evidence_lines() {
+        let pages = vec![PdfTextPage {
+            page: 2,
+            text: "E=mc^2".to_string(),
+        }];
+        let evidence = build_pdf_page_evidence(&pages, None);
+
+        assert_eq!(evidence[0].page, 2);
+        assert_eq!(evidence[0].evidence[0].id, "pdf-page-2-text-1");
+        assert_eq!(evidence[0].evidence[0].source, "pdf-text");
+        assert_eq!(evidence[0].evidence[0].x, 0.0);
+        assert_eq!(evidence[0].evidence[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn builds_page_evidence_from_rendered_images_without_ocr() {
+        let rendered = PdfRenderedDocument {
+            pages: vec![PdfRenderedPage {
+                page: 7,
+                image_width: 1200,
+                image_height: 1600,
+                image_data_url: Some("data:image/jpeg;base64,aW1hZ2U=".to_string()),
+            }],
+        };
+
+        let evidence = build_pdf_page_evidence(&[], Some(&rendered));
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].page, 7);
+        assert!(evidence[0].image_review_required);
+        assert_eq!(evidence[0].image_width, 1200);
+        assert_eq!(evidence[0].image_height, 1600);
+        assert!(evidence[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn extracts_pdf_image_xobjects_with_normalized_page_positions() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            vec![255, 0, 0, 0, 255, 0],
+        );
+        let image_id = document.add_object(image);
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let content_id = document.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf 20 200 Td (image fixture) Tj ET q 200 0 0 100 20 30 cm /Im0 Do Q"
+                .to_vec(),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "Im0" => image_id },
+            },
+            "Contents" => content_id,
+        });
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Count" => 1,
+                "Kids" => vec![Object::Reference(page_id)],
+            },
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut pdf_bytes = Vec::new();
+        document.save_to(&mut pdf_bytes).unwrap();
+
+        let extracted = extract_pdf_content("image-fixture.pdf", &pdf_bytes).unwrap();
+        let evidence = serde_json::to_value(extracted.pdf_evidence.unwrap()).unwrap();
+        let image = evidence["images"].as_array().unwrap().first().unwrap();
+
+        assert_eq!(image["page"], 1);
+        assert_eq!(image["imageWidth"], 2);
+        assert_eq!(image["imageHeight"], 1);
+        assert!((image["x"].as_f64().unwrap() - 0.05).abs() < 0.001);
+        assert!((image["y"].as_f64().unwrap() - 0.675).abs() < 0.001);
+        assert!((image["width"].as_f64().unwrap() - 0.5).abs() < 0.001);
+        assert!((image["height"].as_f64().unwrap() - 0.25).abs() < 0.001);
+        assert!(image["imageDataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn excludes_page_sized_scan_images_from_embedded_note_assets() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            vec![255, 255, 255],
+        ));
+        let content_id = document.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"q 400 0 0 400 0 0 cm /Scan Do Q q 384 0 0 384 8 8 cm /Scan Do Q".to_vec(),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Scan" => image_id },
+            },
+            "Contents" => content_id,
+        });
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Count" => 1,
+                "Kids" => vec![Object::Reference(page_id)],
+            },
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut pdf_bytes = Vec::new();
+        document.save_to(&mut pdf_bytes).unwrap();
+
+        assert!(extract_pdf_embedded_images(&pdf_bytes).is_empty());
+    }
+
+    #[test]
+    fn omits_low_quality_pdf_text_evidence_but_keeps_rendered_page_images() {
+        let rendered = PdfRenderedDocument {
+            pages: vec![PdfRenderedPage {
+                page: 1,
+                image_width: 1200,
+                image_height: 1600,
+                image_data_url: Some("data:image/jpeg;base64,aW1hZ2U=".to_string()),
+            }],
+        };
+        let evidence = build_pdf_page_evidence_from_text_layer(
+            "## 第 1 页\nE[xiu) = Ʃ| xuP\nPEx(n)=□x(n) / N",
+            Some(&rendered),
+        );
+
+        assert_eq!(evidence.pages.len(), 1);
+        assert!(evidence.pages[0].image_review_required);
+        assert!(evidence.pages[0].evidence.is_empty());
+    }
+
+    #[test]
     fn uses_disabled_thinking_and_fixed_tool_choice_for_deepseek_v4_requests() {
         let tool = serde_json::json!({
             "type": "function",
@@ -4202,6 +5367,7 @@ mod tests {
             &[PreviewFilePayload {
                 path: "00-审理确认总览.md".to_string(),
                 content: "# 总览".to_string(),
+                binary: false,
             }],
         )
         .unwrap();
@@ -4231,6 +5397,7 @@ mod tests {
             &[PreviewFilePayload {
                 path: "00-审理确认总览.md".to_string(),
                 content: "# 当前总览".to_string(),
+                binary: false,
             }],
         )
         .unwrap();
@@ -4352,6 +5519,7 @@ mod tests {
                 content: "# Java 控制台输出".to_string(),
                 note_id: "note-java".to_string(),
                 title: "Java 控制台输出".to_string(),
+                binary: false,
             }],
         )
         .unwrap();
@@ -4391,6 +5559,7 @@ mod tests {
                 content: "新内容".to_string(),
                 note_id: "note-python".to_string(),
                 title: "Python 列表 append".to_string(),
+                binary: false,
             }],
         )
         .unwrap();
@@ -4423,6 +5592,7 @@ mod tests {
                 content: "粒度：小颗粒度\n上级主题：[[PWM]]".to_string(),
                 note_id: "note-pwm-modes".to_string(),
                 title: "PWM 计数模式".to_string(),
+                binary: false,
             }],
             &[VaultMoveFilePayload {
                 from_path: "TI嵌入式/MSPM0G3507/PWM.md".to_string(),
@@ -4476,12 +5646,14 @@ mod tests {
                     content: "第一篇".to_string(),
                     note_id: "note-a".to_string(),
                     title: "PWM 计数模式".to_string(),
+                    binary: false,
                 },
                 VaultWriteFilePayload {
                     path: "TI嵌入式/MSPM0G3507/PWM/PWM 计数模式.md".to_string(),
                     content: "第二篇".to_string(),
                     note_id: "note-b".to_string(),
                     title: "PWM 计数模式".to_string(),
+                    binary: false,
                 },
             ],
             &[],
@@ -4563,6 +5735,7 @@ mod tests {
                 content: "bad".to_string(),
                 note_id: "bad".to_string(),
                 title: "bad".to_string(),
+                binary: false,
             }],
         );
 
@@ -4636,12 +5809,14 @@ mod tests {
                     content: "# 新总览".to_string(),
                     note_id: "note-git-overview".to_string(),
                     title: "Git 工具总览".to_string(),
+                    binary: false,
                 },
                 VaultWriteFilePayload {
                     path: "Git/Git工具/基本概念/Git 工具基本概念.md".to_string(),
                     content: "# 基本概念".to_string(),
                     note_id: "note-git-concept".to_string(),
                     title: "Git 工具基本概念".to_string(),
+                    binary: false,
                 },
             ],
         )
@@ -4869,19 +6044,50 @@ mod tests {
     }
 
     #[test]
-    fn detects_noisy_handwritten_pdf_text_for_ocr() {
+    fn detects_noisy_handwritten_pdf_text_layer() {
         let noisy = "STM 2B 基于 ARMcortexM ⾁ 核，串叫 VABT 1 下载，MCV 开发板，(cid:15482)";
         let clean = "STM32 基于 ARM Cortex-M 内核，UART 用于串口通信。";
 
-        assert!(should_attempt_pdf_ocr(noisy));
-        assert!(!should_attempt_pdf_ocr(clean));
+        assert!(is_low_quality_pdf_text_layer(noisy));
+        assert!(!is_low_quality_pdf_text_layer(clean));
     }
 
     #[test]
-    fn detects_pid_handwritten_pdf_text_noise_for_ocr() {
+    fn detects_pid_handwritten_pdf_text_noise() {
         let noisy = "PI1 D→一种闭环控制算法，PI口 输出同时可获取反馈，ontt)= kp* xrror(t)。";
 
-        assert!(should_attempt_pdf_ocr(noisy));
+        assert!(is_low_quality_pdf_text_layer(noisy));
+    }
+
+    #[test]
+    fn detects_linearized_formula_text_as_low_quality() {
+        let noisy = "E[xiu) =Ʃ| xuP\nPEx(n)=□x(n) / N";
+
+        assert!(is_low_quality_pdf_text_layer(noisy));
+        assert!(build_pdf_review_content("公式讲义", noisy, true).contains("页面视觉证据"));
+    }
+
+    #[test]
+    fn excludes_noisy_pdf_text_from_model_content_without_ocr() {
+        let content = build_pdf_review_content(
+            "数字信号处理",
+            "STM 2B 基于 ARMcortexM ⾁ 核，串叫 VABT 1 下载。",
+            true,
+        );
+
+        assert!(!content.contains("STM 2B 基于"));
+        assert!(content.contains("PDF 页面视觉证据"));
+    }
+
+    #[test]
+    fn rejects_noisy_pdf_text_when_page_rendering_failed() {
+        let content = build_pdf_review_content(
+            "数字信号处理",
+            "STM 2B 基于 ARMcortexM ⾁ 核，串叫 VABT 1 下载。",
+            false,
+        );
+
+        assert!(content.is_empty());
     }
 
     #[test]
@@ -4914,6 +6120,9 @@ mod tests {
                     confidence: 0.9,
                 },
             ],
+            image_width: 0,
+            image_height: 0,
+            image_data_url: None,
         };
 
         let blocks = group_ocr_page_blocks(&page);
@@ -4939,6 +6148,9 @@ mod tests {
                     height: 0.03,
                     confidence: 0.88,
                 }],
+                image_width: 0,
+                image_height: 0,
+                image_data_url: None,
             }],
         };
         let content = build_pdf_extracted_content("STM32", "STM 2B 通用输⼊输出", Some(&ocr));
@@ -5000,6 +6212,9 @@ mod tests {
                         confidence: 0.81,
                     },
                 ],
+                image_width: 0,
+                image_height: 0,
+                image_data_url: None,
             }],
         };
 
@@ -5034,6 +6249,9 @@ mod tests {
                         confidence: 0.56,
                     },
                 ],
+                image_width: 0,
+                image_height: 0,
+                image_data_url: None,
             }],
         };
 
@@ -5101,6 +6319,9 @@ mod tests {
                     confidence: 0.72,
                 },
             ],
+            image_width: 0,
+            image_height: 0,
+            image_data_url: None,
         };
 
         let merged = merge_ocr_page_lines(&page);
@@ -5142,6 +6363,9 @@ mod tests {
                     confidence: 0.72,
                 },
             ],
+            image_width: 0,
+            image_height: 0,
+            image_data_url: None,
         };
 
         let merged = merge_ocr_page_lines(&page);
@@ -5164,6 +6388,9 @@ mod tests {
                     height: 0.03,
                     confidence: 0.5,
                 }],
+                image_width: 0,
+                image_height: 0,
+                image_data_url: None,
             }],
         };
 
@@ -5191,6 +6418,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn pdf_page_renderer_is_independent_of_vision_ocr() {
+        assert!(PDF_PAGE_RENDER_SWIFT_SCRIPT.contains("PDFKit"));
+        assert!(PDF_PAGE_RENDER_SWIFT_SCRIPT.contains("imageDataUrl"));
+        assert!(PDF_PAGE_RENDER_SWIFT_SCRIPT.contains("let maxPages = min(document.pageCount, 80)"));
+        assert!(!PDF_PAGE_RENDER_SWIFT_SCRIPT.contains("import Vision"));
+        assert!(!PDF_PAGE_RENDER_SWIFT_SCRIPT.contains("VNRecognizeTextRequest"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn terminates_a_stuck_ocr_process_instead_of_waiting_forever() {
         let mut command = Command::new("/bin/sh");
         command
@@ -5209,7 +6446,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn probes_local_pdf_with_vision_ocr() {
+    fn probes_local_pdf_page_rendering_without_model_ocr() {
         let path = std::env::var("LIFEMIND_OCR_TEST_PDF")
             .expect("set LIFEMIND_OCR_TEST_PDF to a local PDF path");
         let bytes = fs::read(&path).unwrap();
@@ -5220,12 +6457,45 @@ mod tests {
             .to_string();
 
         let extracted = extract_pdf_text(PdfExtractPayload { file_name, bytes }).unwrap();
+        let pages = extracted.pdf_evidence.as_ref().unwrap().pages.as_slice();
 
+        assert_eq!(pages.len(), 7);
+        assert!(pages.iter().all(|page| page.image_review_required));
+        assert!(pages.iter().all(|page| page.image_data_url.is_some()));
+        assert_eq!(extracted.pdf_text_layer_low_quality, Some(true));
+        assert!(pages.iter().all(|page| page.evidence.is_empty()));
+        assert!(extracted.content.contains("PDF 页面视觉证据"));
         println!(
-            "{}",
-            extracted.content.chars().take(3000).collect::<String>()
+            "{} 页均具有独立渲染图，模型正文已排除 OCR 文本。",
+            pages.len()
         );
         assert!(!extracted.content.trim().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn probes_local_pdf_ocr_as_manual_diagnostic_only() {
+        let path = std::env::var("LIFEMIND_OCR_TEST_PDF")
+            .expect("set LIFEMIND_OCR_TEST_PDF to a local PDF path");
+        let bytes = fs::read(&path).unwrap();
+        let file_name = Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("ocr-probe.pdf")
+            .to_string();
+        let ocr = extract_pdf_ocr_with_vision(&bytes, &file_name).unwrap();
+        let line_count = ocr.pages.iter().map(|page| page.lines.len()).sum::<usize>();
+        let image_count = ocr
+            .pages
+            .iter()
+            .filter(|page| page.image_data_url.is_some())
+            .count();
+
+        assert!(line_count > 0);
+        println!(
+            "诊断 OCR 识别到 {line_count} 行，并生成 {image_count} 张图；正式审理链路不会调用 OCR。"
+        );
     }
 
     #[test]

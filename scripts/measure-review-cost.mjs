@@ -149,7 +149,7 @@ async function runScenario(options) {
       provider: "deepseek",
       baseUrl: "https://api.example.test",
       apiKey: "redacted-test-key",
-      model: "deepseek-v4-pro",
+      model: "deepseek-v4-flash",
       fallbackToLocal: false,
       qualityPasses: options.qualityPasses,
       vaultContext: options.vaultContext,

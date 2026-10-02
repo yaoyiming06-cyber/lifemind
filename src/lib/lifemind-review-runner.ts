@@ -37,7 +37,7 @@ export const reviewModelProviderPresets: ReviewModelProviderPreset[] = [
     provider: "deepseek",
     label: "DeepSeek",
     baseUrl: "https://api.deepseek.com",
-    model: "deepseek-v4-pro",
+    model: "deepseek-flash",
     apiFormat: "deepseek-strict-tools",
   },
 ];
@@ -167,6 +167,28 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
       additionalProperties: false,
       properties: {
         protocolVersion: { type: "string", enum: ["lifemind.review.v2"] },
+        pageCoverage: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              sourceId: { type: "string" },
+              page: { type: "integer", minimum: 1 },
+              status: { type: "string", enum: ["covered", "uncertain", "unreadable"] },
+              sectionIds: { type: "array", items: { type: "string" } },
+              evidenceIds: {
+                type: "array",
+                items: {
+                  type: "string",
+                  description: "引用本页 sources[].pdfEvidence.pages[].evidence[].id；若本页图像已在 imagePagesSent 中，可引用该页 assetId。",
+                },
+              },
+              summary: { type: "string" },
+            },
+            required: ["sourceId", "page", "status", "sectionIds", "evidenceIds", "summary"],
+          },
+        },
         stackDecisions: {
           type: "array",
           items: {
@@ -198,26 +220,63 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
                 properties: {
                   mode: { type: "string", enum: ["new-child", "existing-note", "new-root"] },
                   parentNodeId: {
-                    type: ["string", "null"],
+                    anyOf: [{ type: "string" }, { type: "null" }],
                     description:
                       "仅当 mode=new-child 时填写 vaultIndex 中已经存在的 root 或 directory 节点 ID；不能填写本批次 section id、mode 名称或路径。mode=new-root/existing-note 必须为 null。",
                   },
                   branchName: {
-                    type: ["string", "null"],
+                    anyOf: [{ type: "string" }, { type: "null" }],
                     description: "要新建的单个目录名；不要填写完整路径。没有新分支时为 null。",
                   },
                   targetNodeId: {
-                    type: ["string", "null"],
+                    anyOf: [{ type: "string" }, { type: "null" }],
                     description:
                       "仅当 mode=existing-note 时填写 vaultIndex 中已有 note 节点 ID；其他模式必须为 null。",
                   },
                 },
                 required: ["mode", "parentNodeId", "branchName", "targetNodeId"],
               },
-              parentId: { type: ["string", "null"] },
+              parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
               status: { type: "string", enum: ["新建笔记", "合并到旧笔记"] },
-              existingNoteTitle: { type: ["string", "null"] },
+              existingNoteTitle: { anyOf: [{ type: "string" }, { type: "null" }] },
               body: { type: "string" },
+              formulas: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: "string" },
+                    latex: { type: "string" },
+                    display: { type: "string", enum: ["inline", "block"] },
+                    sourcePage: { type: "integer", minimum: 1 },
+                    evidenceId: {
+                      anyOf: [{ type: "string" }, { type: "null" }],
+                      description: "填写对应 PDF 页面的文本 evidence id；若公式仅能从本轮已发送的页面图像确认，可填该页 assetId。",
+                    },
+                    anchor: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    confidence: { type: "string", enum: ["高", "中", "低"] },
+                  },
+                  required: ["id", "latex", "display", "sourcePage", "evidenceId", "anchor", "confidence"],
+                },
+              },
+              imagePlacements: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    assetId: { type: "string" },
+                    sourcePage: { type: "integer", minimum: 1 },
+                    placement: { type: "string", enum: ["before-section", "after-section", "inline"] },
+                    anchor: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    caption: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    alt: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    confidence: { type: "string", enum: ["高", "中", "低"] },
+                  },
+                  required: ["assetId", "sourcePage", "placement", "anchor", "caption", "alt", "confidence"],
+                },
+              },
               evidence: { type: "array", items: { type: "string" } },
             },
             required: [
@@ -231,6 +290,8 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
               "status",
               "existingNoteTitle",
               "body",
+              "formulas",
+              "imagePlacements",
               "evidence",
             ],
           },
@@ -269,7 +330,7 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
         },
         uncertain: { type: "array", items: { type: "string" } },
       },
-      required: ["protocolVersion", "stackDecisions", "sections", "relations", "corrections", "uncertain"],
+      required: ["protocolVersion", "pageCoverage", "stackDecisions", "sections", "relations", "corrections", "uncertain"],
     },
   },
 };
@@ -342,7 +403,7 @@ type OpenAICompatibleResponse = {
   };
 };
 
-const DEFAULT_DRAFT_MAX_OUTPUT_TOKENS = 6_000;
+const DEFAULT_DRAFT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_FINAL_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_REPAIR_MAX_OUTPUT_TOKENS = 16_000;
 
@@ -428,6 +489,12 @@ export async function runReviewSkill(
     return {
       batch: createReviewBatchFromAnalysisPlan(sources, result.output, {
         vaultContext: selectedVaultContext,
+        allowedPdfImageEvidence: result.request.pdfEvidenceImages?.map(({ sourceId, page, assetId, kind }) => ({
+          sourceId,
+          page,
+          assetId,
+          kind,
+        })) ?? [],
       }),
       provider: config.provider,
       usedFallback: false,
@@ -500,6 +567,13 @@ async function callExternalReviewSkillUntilValid(
     knownRootNames: request.vaultContext?.roots.map((root) => root.name) ?? [],
     taxonomyCandidates: request.taxonomyCandidates ?? [],
     vaultIndex: request.vaultIndex ?? [],
+    allowLegacyPathCompatibility: true,
+    allowedPdfImageEvidence: request.pdfEvidenceImages?.map(({ sourceId, page, assetId, kind }) => ({
+      sourceId,
+      page,
+      assetId,
+      kind,
+    })) ?? [],
   };
   const firstResponse = await callExternalReviewSkill(request, config);
   const firstRawOutput = firstResponse.output;
@@ -548,6 +622,13 @@ async function callExternalReviewSkillUntilValid(
     knownRootNames: repairRequest.vaultContext?.roots.map((root) => root.name) ?? [],
     taxonomyCandidates: repairRequest.taxonomyCandidates ?? [],
     vaultIndex: repairRequest.vaultIndex ?? [],
+    allowLegacyPathCompatibility: true,
+    allowedPdfImageEvidence: repairRequest.pdfEvidenceImages?.map(({ sourceId, page, assetId, kind }) => ({
+      sourceId,
+      page,
+      assetId,
+      kind,
+    })) ?? [],
   });
 
   if (!repairedParsed.ok) {
@@ -692,7 +773,7 @@ async function callExternalReviewSkill(
         },
         {
           role: "user",
-          content: JSON.stringify(request),
+          content: buildModelUserContent(request),
         },
       ],
     }),
@@ -712,6 +793,30 @@ async function callExternalReviewSkill(
     output: extractDeepSeekToolArguments(payload, deepSeekReviewTool.function.name),
     usage: normalizeOpenAICompatibleUsage(payload?.usage),
   };
+}
+
+function buildModelUserContent(request: ReviewAnalysisRequest) {
+  const { pdfEvidenceImages, ...textRequest } = request;
+
+  if (!pdfEvidenceImages?.length) return JSON.stringify(textRequest);
+
+  const imageContext = pdfEvidenceImages
+    .map((image) => {
+      const kind = image.kind === "embedded" ? "PDF 内嵌图片" : "PDF 页面渲染图（仅供审理）";
+      const position = image.kind === "embedded"
+        ? `，位置 x=${image.x ?? 0}、y=${image.y ?? 0}、width=${image.width ?? 0}、height=${image.height ?? 0}`
+        : "";
+      return `${kind}：资产 ${image.assetId}，来源 ${image.sourceId}，第 ${image.page} 页${position}。`;
+    })
+    .join("\n");
+
+  return [
+    { type: "text", text: `${JSON.stringify(textRequest)}\n\n${imageContext}` },
+    ...pdfEvidenceImages.map((image) => ({
+      type: "image_url",
+      image_url: { url: image.imageDataUrl },
+    })),
+  ];
 }
 
 export function getReviewModelProviderPreset(provider: ReviewSkillProvider) {

@@ -35,19 +35,23 @@ v2 不允许模型直接输出最终笔记 Markdown。模型输出 `stackDecisio
 
 ## 已支持模型接口格式
 
-- DeepSeek V4 Thinking + Strict Tool Call（Chat Completions 兼容请求，使用 `tools`、`thinking`、`reasoning_effort` 和 `strict: true`；V4 思考模式不发送固定函数对象形式的 `tool_choice`）
+- DeepSeek Flash + Strict Tool Call（Chat Completions 兼容请求，使用 `tools`、`thinking: { type: "disabled" }` 和 `strict: true`；当前结构化审理关闭 thinking，以保持工具调用和输出长度稳定）
 - 严格工具调用统一请求 `https://api.deepseek.com/beta/chat/completions`；用户填写的 base URL 由 LifeMind 自动规范化。
 
 ## 已内置模型
 
-- DeepSeek `deepseek-v4-pro`
+- DeepSeek `deepseek-flash`（旧版模型设置会迁移到该名称）
+
+PDF 文本层会在本地计算困难文字占比：不超过 20% 正常审理，20%～30% 允许审理但提示风险，30%～50% 只允许部分审理，超过 50% 停止生成确定知识；关键公式、标题、定义和关系中的无法确认文字始终需要人工复核。
+
+PDF 页面会独立渲染为视觉证据并发送给支持视觉输入的模型。页面图像是手写内容、版面和数学公式的主要依据；低质量 PDF 文本层会从模型正文和逐行证据中移除。正式审理链路不运行 OCR；OCR 代码只保留在开发测试诊断中。
 
 当前版本暂不暴露其他外部模型供应商。模型不可用时，是否启用本地 fallback 由用户在设置页决定。
 
 ## 成本控制
 
-- draft-pass 默认 `max_tokens=6000`，final-pass 默认 `max_tokens=10000`；单轮审理默认使用 `max_tokens=10000`，防止 thinking 或结构化输出异常增长。
-- 两轮正式审理仍保留最终复审质量，但 draft-pass 对 DeepSeek V4 关闭 thinking；final-pass 使用较低的 `reasoning_effort=low`，避免把大量输出预算消耗在重复推理上。
+- draft-pass、final-pass 和单轮审理默认使用 `max_tokens=10000`，防止 thinking 或结构化输出异常增长。
+- 两轮正式审理仍保留最终复审质量；draft-pass 和 final-pass 都关闭 thinking，避免把输出预算消耗在不可见推理上，并让严格工具调用保持稳定。
 - Vault 索引先由本地相关性筛选，最多向模型发送 12 篇相关旧笔记和 40 条关系；全库扫描结果不会原样塞进每次请求。
 - 审理请求的稳定字段排在 pass-specific 字段前面，使两轮请求尽可能复用 DeepSeek 的前缀缓存。
 - 协议校验失败最多只追加一次修复请求，不允许无限重试。
@@ -86,9 +90,31 @@ v2 不允许模型直接输出最终笔记 Markdown。模型输出 `stackDecisio
         "branchName": "基本概念",
         "targetNodeId": null
       },
-      "parentId": "src-1-overview",
+      "parentId": null,
       "status": "新建笔记",
-      "body": "只包含该知识段正文，不包含文件标题和元数据。",
+      "body": "序列满足以下递推关系：{{formula:src-1-formula-1}}",
+      "formulas": [
+        {
+          "id": "src-1-formula-1",
+          "latex": "x[n] = x[n-1] + u[n]",
+          "display": "block",
+          "sourcePage": 1,
+          "evidenceId": null,
+          "anchor": "{{formula:src-1-formula-1}}",
+          "confidence": "高"
+        }
+      ],
+      "imagePlacements": [
+        {
+          "assetId": "pdf-image-src-1-page-1-1",
+          "sourcePage": 1,
+          "placement": "after-section",
+          "anchor": null,
+          "caption": "序列计算示意图",
+          "alt": "PDF 内嵌的序列计算示意图",
+          "confidence": "高"
+        }
+      ],
       "evidence": ["原文对应段落"]
     }
   ],
@@ -112,6 +138,21 @@ v2 不允许模型直接输出最终笔记 Markdown。模型输出 `stackDecisio
   "uncertain": []
 }
 ```
+
+含页面证据的 PDF 还必须返回顶层 `pageCoverage`，每个输入页恰好一项：
+
+```json
+{
+  "sourceId": "src-1",
+  "page": 1,
+  "status": "covered",
+  "sectionIds": ["src-1-topic"],
+  "evidenceIds": [],
+  "summary": "第 1 页已按页面图像审理。"
+}
+```
+
+公式正文使用 `{{formula:<id>}}` 锚点，由本地编译为 LaTeX 数学块。整页渲染图只作为模型审理上下文，不写入笔记或 Vault；笔记图片只能由 `imagePlacements` 引用本轮实际发送的 PDF 内嵌图片，并由本地编译到 `附件/PDF图片/`。PDF 笔记会按主题首次出现的页序放入带序号的二级目录，保证技术栈根目录下不直接堆放批次笔记。
 
 `sections[].placement` 的 `parentNodeId` 只能引用 `vaultIndex` 中已经存在的根节点或目录节点，不能填写本批次 `sections[].id`。当当前技术栈在 Vault 中还没有对应根节点或目录时，使用 `new-root` 并把新笔记之间的关系写在 `parentId`。`sections[].path` 仅作为旧版本兼容字段，必须是技术栈根目录下的安全相对目录数组，不能包含绝对路径或 `..`。`parentId` 只能引用本次 `sections[].id`。用户填写的 `stackHint` 是根目录约束，模型不得改成其他技术栈。
 

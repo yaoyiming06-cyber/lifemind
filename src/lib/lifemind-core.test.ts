@@ -123,7 +123,7 @@ describe("lifemind review core", () => {
     expect(files.map((file) => file.path)).toContain("00-审理确认总览.md");
     expect(files.map((file) => file.path)).toContain("00-原始上传/src-java-Java 控制台输出原文.md");
     expect(files.map((file) => file.path)).toContain("10-审理结果/Java 控制台输出.md");
-    expect(files.map((file) => file.path)).toContain("20-生成预览/Java/00-Java 导览.md");
+    expect(files.map((file) => file.path)).toContain("20-生成预览/Java/00-导览/00-Java 导览.md");
     expect(files.map((file) => file.path)).toContain("20-生成预览/Java/Java基础语法/输入与输出/Java 控制台输出.md");
     expect(files.find((file) => file.path === "00-审理确认总览.md")?.content).toContain(
       "[[20-生成预览/Java/Java基础语法/输入与输出/Java 控制台输出|Java 控制台输出]]",
@@ -340,6 +340,582 @@ describe("lifemind review core", () => {
     expect(relationProperties.target).toBeUndefined();
   });
 
+  it("requires PDF page coverage and compiles verified formulas and page image placements", () => {
+    const source: IntakeSource = {
+      id: "src-dsp-pdf",
+      title: "数字信号处理",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [
+          {
+            page: 1,
+            assetId: "pdf-page-src-dsp-pdf-page-1",
+            imageWidth: 1200,
+            imageHeight: 1600,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [
+              {
+                id: "pdf-page-1-text-1",
+                text: "x[n] = x[n-1]",
+                source: "pdf-text",
+                confidence: 1,
+                candidates: [],
+              },
+            ],
+          },
+        ],
+        images: [
+          {
+            assetId: "pdf-image-src-dsp-pdf-page-1-1",
+            page: 1,
+            imageWidth: 320,
+            imageHeight: 180,
+            x: 0.2,
+            y: 0.3,
+            width: 0.4,
+            height: 0.2,
+            imageDataUrl: "data:image/png;base64,aW1hZ2U=",
+          },
+        ],
+      },
+    };
+    const plan = {
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [
+        {
+          sourceId: source.id,
+          page: 1,
+          status: "covered",
+          sectionIds: ["dsp-sequence"],
+          evidenceIds: ["pdf-page-src-dsp-pdf-page-1"],
+          summary: "第 1 页说明序列递推关系。",
+        },
+      ],
+      stackDecisions: [
+        { sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["用户技术栈提示"] },
+      ],
+      sections: [
+        {
+          id: "dsp-sequence",
+          sourceId: source.id,
+          title: "序列递推",
+          role: "基本原理",
+          grain: "中颗粒度",
+          path: ["序列"],
+          status: "新建笔记",
+          existingNoteTitle: null,
+          body: "序列递推关系见 {{formula:sequence-recursion}}。",
+          formulas: [
+            {
+              id: "sequence-recursion",
+              latex: "x[n] = x[n-1] + u[n]",
+              display: "block",
+              sourcePage: 1,
+              evidenceId: "pdf-page-src-dsp-pdf-page-1",
+              anchor: "{{formula:sequence-recursion}}",
+              confidence: "高",
+            },
+          ],
+          imagePlacements: [
+            {
+              assetId: "pdf-image-src-dsp-pdf-page-1-1",
+              sourcePage: 1,
+              placement: "after-section",
+              caption: "序列递推示意图",
+              alt: "序列递推示意图",
+              confidence: "高",
+            },
+          ],
+          evidence: ["第 1 页递推关系"],
+        },
+      ],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    };
+
+    const parsedWithoutSentImage = parseReviewAnalysisPlan(JSON.stringify(plan), [source]);
+    expect(parsedWithoutSentImage.ok).toBe(false);
+
+    const parsed = parseReviewAnalysisPlan(JSON.stringify(plan), [source], {
+      allowedPdfImageEvidence: [
+        {
+          sourceId: source.id,
+          page: 1,
+          assetId: "pdf-page-src-dsp-pdf-page-1",
+          kind: "page",
+        },
+        {
+          sourceId: source.id,
+          page: 1,
+          assetId: "pdf-image-src-dsp-pdf-page-1-1",
+          kind: "embedded",
+        },
+      ],
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected PDF analysis plan to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, {
+      allowedPdfImageEvidence: [
+        {
+          sourceId: source.id,
+          page: 1,
+          assetId: "pdf-page-src-dsp-pdf-page-1",
+          kind: "page",
+        },
+        {
+          sourceId: source.id,
+          page: 1,
+          assetId: "pdf-image-src-dsp-pdf-page-1-1",
+          kind: "embedded",
+        },
+      ],
+    });
+    expect(batch.notes[0]?.markdown).toContain("$$\nx[n] = x[n-1] + u[n]\n$$");
+    expect(batch.notes[0]?.markdown).toContain("![[附件/PDF图片/pdf-image-src-dsp-pdf-page-1-1.png]]");
+    expect(buildVaultWriteFiles(batch).map((file) => file.path)).toContain(
+      "附件/PDF图片/pdf-image-src-dsp-pdf-page-1-1.png",
+    );
+    expect(buildPreviewFiles(batch).map((file) => file.path)).toContain(
+      "附件/PDF图片/pdf-image-src-dsp-pdf-page-1-1.png",
+    );
+    expect(buildVaultWriteFiles(batch).some((file) => file.path.startsWith("附件/PDF页面/"))).toBe(false);
+    expect(buildVaultWriteFiles(batch).find((file) => file.path.endsWith(".png"))?.binary).toBe(true);
+  });
+
+  it("compiles PDF formulas without inserting rendered page evidence when media fields are omitted", () => {
+    const source: IntakeSource = {
+      id: "src-dsp-fallback-media",
+      title: "数字信号处理",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [
+          {
+            page: 1,
+            imageWidth: 1200,
+            imageHeight: 1600,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [],
+          },
+        ],
+      },
+    };
+    const plan = {
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [
+        {
+          sourceId: source.id,
+          page: 1,
+          status: "covered",
+          sectionIds: ["dsp-fallback-section"],
+          evidenceIds: [],
+          summary: "第 1 页已审理。",
+        },
+      ],
+      stackDecisions: [
+        { sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["用户技术栈提示"] },
+      ],
+      sections: [
+        {
+          id: "dsp-fallback-section",
+          sourceId: source.id,
+          title: "z 变换",
+          role: "基本原理",
+          grain: "中颗粒度",
+          path: ["z 变换"],
+          status: "新建笔记",
+          existingNoteTitle: null,
+          body: "- 双边变换：X(z) = Σ x(n)z^{−n}。",
+          formulas: [],
+          imagePlacements: [],
+          evidence: ["第 1 页"],
+        },
+      ],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    };
+
+    const parsed = parseReviewAnalysisPlan(JSON.stringify(plan), [source]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected fallback media plan to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output);
+    expect(batch.notes[0]?.title).toBe("1.1 z 变换");
+    expect(batch.notes[0]?.markdown).toContain("$X(z) = \\sum x(n)z^{-n}$");
+    expect(batch.notes[0]?.markdown).not.toContain("附件/PDF页面");
+    expect(buildVaultWriteFiles(batch).some((file) => file.path.startsWith("附件/PDF页面/"))).toBe(false);
+  });
+
+  it("never writes rendered PDF page evidence into notes or vault attachments", () => {
+    const source: IntakeSource = {
+      id: "src-no-page-evidence-attachments",
+      title: "数字信号处理",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [
+          {
+            page: 1,
+            imageWidth: 1200,
+            imageHeight: 1600,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [],
+          },
+        ],
+      },
+    };
+    const parsed = parseReviewAnalysisPlan(JSON.stringify({
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [{
+        sourceId: source.id,
+        page: 1,
+        status: "covered",
+        sectionIds: ["sequence-overview"],
+        evidenceIds: [],
+        summary: "第 1 页已审理。",
+      }],
+      stackDecisions: [{ sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: [{
+        id: "sequence-overview",
+        sourceId: source.id,
+        title: "序列运算",
+        role: "基本原理",
+        grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: "序列运算", targetNodeId: null },
+        parentId: null,
+        status: "新建笔记",
+        existingNoteTitle: null,
+        body: "序列运算按离散索引进行。",
+        formulas: [],
+        imagePlacements: [],
+        evidence: ["第 1 页"],
+      }],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    }), [source], {
+      allowedPdfImageEvidence: [{
+        sourceId: source.id,
+        page: 1,
+        assetId: "pdf-image-src-embedded-image-page-1-1",
+        kind: "embedded",
+      }],
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected PDF analysis plan to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, {
+      allowedPdfImageEvidence: [{
+        sourceId: source.id,
+        page: 1,
+        assetId: "pdf-image-src-embedded-image-page-1-1",
+        kind: "embedded",
+      }],
+    });
+    const files = buildVaultWriteFiles(batch);
+
+    expect(batch.notes[0]?.markdown).not.toContain("附件/PDF页面");
+    expect(files.some((file) => file.path.startsWith("附件/PDF页面/"))).toBe(false);
+    expect(files.some((file) => file.binary)).toBe(false);
+  });
+
+  it("places every PDF note in a numbered topic folder ordered by first covered page", () => {
+    const source: IntakeSource = {
+      id: "src-numbered-pdf-folders",
+      title: "数字信号处理",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [1, 2, 3].map((page) => ({
+          page,
+          imageWidth: 0,
+          imageHeight: 0,
+          imageReviewRequired: false,
+          evidence: [],
+        })),
+      },
+    };
+    const sections = [
+      { id: "z-transform", title: "Z 变换", branchName: "Z 变换", page: 3 },
+      { id: "convolution", title: "序列的卷积和", branchName: "序列的卷积和", page: 2 },
+      { id: "sequence", title: "序列的运算", branchName: "序列的运算", page: 1 },
+    ];
+    const parsed = parseReviewAnalysisPlan(JSON.stringify({
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: sections.map((section) => ({
+        sourceId: source.id,
+        page: section.page,
+        status: "covered",
+        sectionIds: [section.id],
+        evidenceIds: [],
+        summary: `第 ${section.page} 页已审理。`,
+      })),
+      stackDecisions: [{ sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: sections.map((section) => ({
+        id: section.id,
+        sourceId: source.id,
+        title: section.title,
+        role: "基本原理",
+        grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: section.branchName, targetNodeId: null },
+        parentId: null,
+        status: "新建笔记",
+        existingNoteTitle: null,
+        body: `${section.title}的正文。`,
+        formulas: [],
+        imagePlacements: [],
+        evidence: [`第 ${section.page} 页`],
+      })),
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    }), [source]);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected PDF analysis plan to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output);
+    const foldersByTopic = Object.fromEntries(batch.notes.map((note) => [
+      note.title.replace(/^\d+\.\d+\s+/u, ""),
+      note.path.split(" / ")[1],
+    ]));
+
+    expect(foldersByTopic).toEqual({
+      "Z 变换": "03-Z 变换",
+      "序列的卷积和": "02-序列的卷积和",
+      "序列的运算": "01-序列的运算",
+    });
+    expect(batch.notes.every((note) => note.path.split(" / ").length === 2)).toBe(true);
+    expect(batch.notes.every((note) => /^\d{2}-/u.test(note.path.split(" / ")[1] ?? ""))).toBe(true);
+  });
+
+  it("writes only an extracted PDF image asset at the model-selected note location", () => {
+    const source = {
+      id: "src-embedded-image",
+      title: "信号处理",
+      type: "pdf",
+      stackHint: "信号处理",
+      content: "正文",
+      pdfEvidence: {
+        pages: [{ page: 1, imageWidth: 1000, imageHeight: 1400, imageReviewRequired: false, evidence: [] }],
+        images: [{
+          assetId: "pdf-image-src-embedded-image-page-1-1",
+          page: 1,
+          imageWidth: 320,
+          imageHeight: 180,
+          x: 0.2,
+          y: 0.3,
+          width: 0.4,
+          height: 0.2,
+          imageDataUrl: "data:image/png;base64,aW1hZ2U=",
+        }],
+      },
+    } as unknown as IntakeSource;
+    const parsed = parseReviewAnalysisPlan(JSON.stringify({
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [{ sourceId: source.id, page: 1, status: "covered", sectionIds: ["filter-response"], evidenceIds: [], summary: "第 1 页已审理。" }],
+      stackDecisions: [{ sourceId: source.id, name: "信号处理", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: [{
+        id: "filter-response",
+        sourceId: source.id,
+        title: "滤波器响应",
+        role: "基本原理",
+        grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: "滤波器响应", targetNodeId: null },
+        parentId: null,
+        status: "新建笔记",
+        existingNoteTitle: null,
+        body: "频率响应如下图所示。\n\n![[附件/PDF页面/pdf-page-src-embedded-image-page-1.jpg]]",
+        formulas: [],
+        imagePlacements: [{ assetId: "pdf-image-src-embedded-image-page-1-1", sourcePage: 1, placement: "after-section", anchor: null, caption: "频率响应曲线", alt: "滤波器频率响应", confidence: "高" }],
+        evidence: ["第 1 页图表"],
+      }],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    }), [source], {
+      allowedPdfImageEvidence: [{
+        sourceId: source.id,
+        page: 1,
+        assetId: "pdf-image-src-embedded-image-page-1-1",
+        kind: "embedded",
+      }],
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected extracted PDF image placement to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, {
+      allowedPdfImageEvidence: [{
+        sourceId: source.id,
+        page: 1,
+        assetId: "pdf-image-src-embedded-image-page-1-1",
+        kind: "embedded",
+      }],
+    });
+    const files = buildVaultWriteFiles(batch);
+
+    expect(batch.notes[0]?.markdown).toContain("![[附件/PDF图片/pdf-image-src-embedded-image-page-1-1.png]]");
+    expect(batch.notes[0]?.markdown).not.toContain("PDF页面");
+    expect(batch.notes[0]?.markdown).not.toContain("pdf-page-src-embedded-image-page-1");
+    expect(files.map((file) => file.path)).toContain("附件/PDF图片/pdf-image-src-embedded-image-page-1-1.png");
+    expect(files.some((file) => file.path.startsWith("附件/PDF页面/"))).toBe(false);
+  });
+
+  it("numbers PDF sections in page order and keeps existing chapter numbers", () => {
+    const source: IntakeSource = {
+      id: "src-numbered-pdf",
+      title: "信号与系统",
+      type: "pdf",
+      stackHint: "信号与系统",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [
+          { page: 1, imageWidth: 100, imageHeight: 100, imageReviewRequired: true, imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=", evidence: [] },
+          { page: 2, imageWidth: 100, imageHeight: 100, imageReviewRequired: true, imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=", evidence: [] },
+        ],
+      },
+    };
+    const parsed = parseReviewAnalysisPlan(JSON.stringify({
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [
+        { sourceId: source.id, page: 1, status: "covered", sectionIds: ["sec-chapter", "sec-energy"], evidenceIds: [], summary: "第 1 页" },
+        { sourceId: source.id, page: 2, status: "covered", sectionIds: ["sec-convolution"], evidenceIds: [], summary: "第 2 页" },
+      ],
+      stackDecisions: [{ sourceId: source.id, name: "信号与系统", confidence: "高", evidence: ["提示"] }],
+      sections: [
+        {
+          id: "sec-chapter", sourceId: source.id, title: "第一章 序列", role: "总览", grain: "大颗粒度",
+          path: ["序列"], status: "新建笔记", existingNoteTitle: null, body: "序列是离散时间信号。", formulas: [], imagePlacements: [], evidence: ["第 1 页"],
+        },
+        {
+          id: "sec-energy", sourceId: source.id, title: "序列的能量", role: "基本原理", grain: "中颗粒度",
+          path: ["序列"], parentId: "sec-chapter", status: "新建笔记", existingNoteTitle: null, body: "能量定义。", formulas: [], imagePlacements: [], evidence: ["第 1 页"],
+        },
+        {
+          id: "sec-convolution", sourceId: source.id, title: "序列的卷积和", role: "基本原理", grain: "中颗粒度",
+          path: ["序列"], parentId: "sec-chapter", status: "新建笔记", existingNoteTitle: null, body: "卷积定义。", formulas: [], imagePlacements: [], evidence: ["第 2 页"],
+        },
+      ],
+      relations: [], corrections: [], uncertain: [],
+    }), [source]);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected numbered PDF plan to pass");
+
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output);
+    expect(batch.notes.map((note) => note.title)).toEqual([
+      "第一章 序列",
+      "1.1 序列的能量",
+      "1.2 序列的卷积和",
+    ]);
+  });
+
+  it("continues PDF numbering from existing Vault notes and starts a new chapter at the next number", () => {
+    const source: IntakeSource = {
+      id: "src-number-continuation",
+      title: "数字信号处理续记",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [{ page: 1, imageWidth: 100, imageHeight: 100, imageReviewRequired: true, imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=", evidence: [] }],
+      },
+    };
+    const plan = {
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [{ sourceId: source.id, page: 1, status: "covered", sectionIds: ["same", "new"], evidenceIds: [], summary: "第 1 页" }],
+      stackDecisions: [{ sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["提示"] }],
+      sections: [
+        { id: "same", sourceId: source.id, title: "序列的周期性", role: "基本原理", grain: "中颗粒度", path: ["序列"], status: "新建笔记", existingNoteTitle: null, body: "周期。", formulas: [], imagePlacements: [], evidence: ["第 1 页"] },
+        { id: "new", sourceId: source.id, title: "傅里叶变换", role: "基本原理", grain: "中颗粒度", path: ["变换"], status: "新建笔记", existingNoteTitle: null, body: "变换。", formulas: [], imagePlacements: [], evidence: ["第 1 页"] },
+      ],
+      relations: [], corrections: [], uncertain: [],
+    };
+    const vaultContext = {
+      roots: [{ name: "数字信号处理", noteCount: 3, paths: ["数字信号处理", "数字信号处理/序列"] }],
+      notes: [
+        { title: "2.1 序列的能量", path: "数字信号处理/序列/2.1 序列的能量.md", root: "数字信号处理", headings: [], snippet: "" },
+        { title: "2.2 序列的卷积和", path: "数字信号处理/序列/2.2 序列的卷积和.md", root: "数字信号处理", headings: [], snippet: "" },
+        { title: "2.3 序列的相关", path: "数字信号处理/序列/2.3 序列的相关.md", root: "数字信号处理", headings: [], snippet: "" },
+      ],
+      relations: [],
+    };
+    const parsed = parseReviewAnalysisPlan(JSON.stringify(plan), [source]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected continuation plan to pass");
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, { vaultContext });
+    expect(batch.notes.map((note) => note.title)).toEqual(["2.4 序列的周期性", "3.1 傅里叶变换"]);
+  });
+
+  it("rejects a PDF analysis plan with an omitted page coverage entry", () => {
+    const source: IntakeSource = {
+      id: "src-dsp-coverage",
+      title: "数字信号处理覆盖测试",
+      type: "pdf",
+      stackHint: "数字信号处理",
+      content: "【PDF 页面视觉证据】",
+      pdfEvidence: {
+        pages: [
+          {
+            page: 1,
+            imageWidth: 100,
+            imageHeight: 100,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [],
+          },
+          {
+            page: 2,
+            imageWidth: 100,
+            imageHeight: 100,
+            imageReviewRequired: true,
+            imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+            evidence: [],
+          },
+        ],
+      },
+    };
+    const parsed = parseReviewAnalysisPlan(
+      JSON.stringify({
+        protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+        pageCoverage: [
+          {
+            sourceId: source.id,
+            page: 1,
+            status: "covered",
+            sectionIds: [],
+            evidenceIds: [],
+            summary: "第 1 页。",
+          },
+        ],
+        stackDecisions: [{ sourceId: source.id, name: "数字信号处理", confidence: "高", evidence: ["提示"] }],
+        sections: [],
+        relations: [],
+        corrections: [],
+        uncertain: [],
+      }),
+      [source],
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) throw new Error("expected missing page coverage to fail");
+    expect(parsed.errors.some((error) => /覆盖|第 2 页/u.test(error.message))).toBe(true);
+  });
+
   it("compiles a v2 plan into structured notes without allowing a wrong model root", () => {
     const sources: IntakeSource[] = [
       {
@@ -531,12 +1107,13 @@ describe("lifemind review core", () => {
       uncertain: [],
     });
 
-    expect(batch.notes.map((note) => note.path)).toEqual([
-      "操作系统 / 总览",
-      "操作系统 / 基本特征",
-      "操作系统 / 进程与线程",
-      "操作系统 / 处理机调度",
-      "操作系统 / 内存管理",
+    expect(batch.notes.every((note) => note.path.startsWith("操作系统 / "))).toBe(true);
+    expect(batch.notes.map((note) => note.path.split(" / ")[1])).toEqual([
+      "01-操作系统基本特征",
+      "02-进程与线程",
+      "03-处理机调度",
+      "04-内存管理",
+      "05-文件管理",
     ]);
     expect(batch.notes.every((note) => !note.path.includes("所有文件放一起"))).toBe(true);
   });
@@ -1688,14 +2265,175 @@ describe("lifemind review core", () => {
     expect(prepared.warnings).toEqual([]);
   });
 
+  it("keeps PDF review in normal mode when difficult text is at most 20 percent", () => {
+    const prepared = preparePdfExtractedContent("正常 PDF", `${"a".repeat(80)}${"�".repeat(20)}`);
+
+    expect(prepared.quality.qualityStatus).toBe("normal");
+    expect(prepared.quality.difficultyRatio).toBeCloseTo(0.2, 5);
+    expect(prepared.quality.requiresManualReview).toBe(false);
+  });
+
+  it("warns when difficult PDF text is between 20 and 30 percent", () => {
+    const prepared = preparePdfExtractedContent("风险 PDF", `${"a".repeat(75)}${"�".repeat(25)}`);
+
+    expect(prepared.quality.qualityStatus).toBe("warning");
+    expect(prepared.quality.difficultyRatio).toBeCloseTo(0.25, 5);
+    expect(prepared.warnings.join(" ")).toContain("20%～30%");
+  });
+
+  it("limits PDF review to confirmed portions when difficult text is between 30 and 50 percent", () => {
+    const prepared = preparePdfExtractedContent("部分 PDF", `${"a".repeat(60)}${"�".repeat(40)}`);
+
+    expect(prepared.quality.qualityStatus).toBe("partial");
+    expect(prepared.quality.difficultyRatio).toBeCloseTo(0.4, 5);
+    expect(prepared.content).toContain("只允许对可确认内容进行部分审理");
+  });
+
+  it("blocks definite PDF knowledge when difficult text exceeds 50 percent", () => {
+    const prepared = preparePdfExtractedContent("阻断 PDF", `${"a".repeat(40)}${"�".repeat(60)}`);
+
+    expect(prepared.quality.qualityStatus).toBe("blocked");
+    expect(prepared.quality.difficultyRatio).toBeCloseTo(0.6, 5);
+    expect(prepared.quality.requiresManualReview).toBe(true);
+    expect(prepared.content).toContain("禁止生成确定知识");
+  });
+
+  it("requires review when a difficult character appears in a critical formula line", () => {
+    const prepared = preparePdfExtractedContent("公式 PDF", "1. 核心公式：� = x / y\n普通说明文字");
+
+    expect(prepared.quality.qualityStatus).toBe("normal");
+    expect(prepared.quality.requiresManualReview).toBe(true);
+    expect(prepared.quality.criticalUnresolved).toContain("1. 核心公式：� = x / y");
+  });
+
+  it("passes PDF quality metadata and constraints into the analysis request", () => {
+    const prepared = preparePdfExtractedContent("部分 PDF", `${"a".repeat(60)}${"�".repeat(40)}`);
+    const request = createReviewAnalysisRequest([
+      {
+        id: "pdf-quality-source",
+        title: "部分 PDF",
+        type: "pdf",
+        stackHint: "嵌入式",
+        content: prepared.content,
+        pdfQuality: prepared.quality,
+      },
+    ]);
+
+    expect(request.sources[0]?.pdfQuality).toEqual(prepared.quality);
+    expect(request.constraints.join("\n")).toContain("只允许对可确认片段生成 sections");
+    expect(request.constraints.join("\n")).toContain("部分 PDF");
+  });
+
+  it("passes normalized PDF page evidence and difficulty metrics into the model request", () => {
+    const request = createReviewAnalysisRequest([
+      {
+        id: "pdf-evidence-source",
+        title: "公式扫描件",
+        type: "pdf",
+        content: "第 2 页：E=mc^2",
+        pdfEvidence: {
+          pages: [
+            {
+              page: 2,
+              imageWidth: 1200,
+              imageHeight: 1600,
+              imageReviewRequired: true,
+              imageDataUrl: "data:image/jpeg;base64,aW1hZ2U=",
+              evidence: [
+                {
+                  id: "pdf-page-2-text-1",
+                  text: "E=mc^2",
+                  source: "pdf-text",
+                  x: 0.1,
+                  y: 0.2,
+                  width: 0.3,
+                  height: 0.05,
+                  confidence: 1,
+                  candidates: [],
+                },
+              ],
+            },
+          ],
+          images: [{
+            assetId: "pdf-image-pdf-evidence-source-page-2-1",
+            page: 2,
+            imageWidth: 320,
+            imageHeight: 180,
+            x: 0.125,
+            y: 0.25,
+            width: 0.5,
+            height: 0.25,
+            imageDataUrl: "data:image/png;base64,aW1hZ2U=",
+          }],
+        },
+        pdfQuality: {
+          qualityStatus: "warning",
+          difficultyRatio: 0.25,
+          difficultCharacterCount: 25,
+          totalCharacterCount: 100,
+          requiresManualReview: true,
+          criticalUnresolved: ["公式：� = x / y"],
+        },
+      },
+    ]);
+
+    expect(request.sources[0]?.pdfEvidence?.pages[0]).toMatchObject({
+      page: 2,
+      imageReviewRequired: true,
+      evidence: [{ id: "pdf-page-2-text-1", x: 0.1, y: 0.2, confidence: 1 }],
+    });
+    expect(request.sources[0]?.pdfEvidence?.pages[0]?.imageDataUrl).toBeUndefined();
+    expect(request.pdfPageManifest?.[0]).toMatchObject({
+      imagePagesSent: [2],
+      embeddedImages: [{
+        assetId: "pdf-image-pdf-evidence-source-page-2-1",
+        page: 2,
+        x: 0.125,
+        y: 0.25,
+        width: 0.5,
+        height: 0.25,
+      }],
+      embeddedImagesSent: ["pdf-image-pdf-evidence-source-page-2-1"],
+      embeddedImagesOmitted: [],
+    });
+    expect(request.pdfEvidenceImages).toContainEqual(expect.objectContaining({
+      sourceId: "pdf-evidence-source",
+      page: 2,
+      assetId: "pdf-image-pdf-evidence-source-page-2-1",
+      kind: "embedded",
+      x: 0.125,
+      y: 0.25,
+    }));
+    expect(request.constraints.join("\n")).toContain("视觉复核");
+    expect(request.pdfPageManifest?.[0]?.imagePagesSent).toEqual([2]);
+    expect(request.constraints.join("\n")).toContain("assetId");
+  });
+
+  it("assesses the original PDF text layer even when the model body uses a visual placeholder", () => {
+    const prepared = preparePdfExtractedContent(
+      "数字信号处理",
+      "【PDF 页面视觉证据】\nPDF 文本层质量不足，已从模型正文中移除。",
+      undefined,
+      "E[xiu) = Ʃ| xuP\nPEx(n)=□x(n) / N",
+      true,
+    );
+
+    expect(prepared.quality.qualityStatus).toBe("warning");
+    expect(prepared.quality.requiresManualReview).toBe(true);
+    expect(prepared.quality.textLayerLowQuality).toBe(true);
+    expect(prepared.content).not.toContain("E[xiu)");
+    expect(prepared.content).toContain("页面视觉证据");
+  });
+
   it("instructs the review skill to repair handwritten PDF extraction noise semantically", () => {
     const prompt = buildReviewSkillSystemPrompt();
 
     expect(prompt).toContain("手写");
     expect(prompt).toContain("扫描 PDF");
-    expect(prompt).toContain("OCR 后处理");
-    expect(prompt).toContain("本地 Vision OCR 页面结构");
-    expect(prompt).toContain("OCR 候选证据");
+    expect(prompt).toContain("PDF 页面图像是版面、手写内容和数学公式的主要证据");
+    expect(prompt).toContain("忽略其逐行文字证据");
+    expect(prompt).not.toContain("OCR");
+    expect(prompt).not.toContain("优先以本地 Vision OCR 页面结构");
     expect(prompt).toContain("不要逐字照搬");
   });
 
@@ -2450,7 +3188,7 @@ git checkout -b feature/login`,
     };
     const batch = createReviewBatchFromAnalysisPlan([source], plan);
 
-    expect(batch.notes[0].path).toBe("操作系统 / 总览");
+    expect(batch.notes[0].path).toMatch(/^操作系统 \/ 01-.+ \/ 总览$/u);
     expect(batch.notes[0].path).not.toContain("就绪队列指针");
     expect(batch.notes[0].path).not.toContain("FCB");
   });

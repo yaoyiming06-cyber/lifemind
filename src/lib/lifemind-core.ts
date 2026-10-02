@@ -12,6 +12,9 @@ import {
   type ReviewAnalysisPlacement,
   type ReviewAnalysisRelation,
   type ReviewAnalysisSection,
+  type ReviewAnalysisFormula,
+  type ReviewAnalysisImagePlacement,
+  type ReviewAnalysisPageCoverage,
   type ReviewAnalysisValidationOptions,
   type ReviewSkillOutput,
   type SourceOrganizationSignal,
@@ -20,7 +23,7 @@ import {
   type VaultKnowledgeNode,
   type VaultKnowledgeRoot,
 } from "./lifemind-review-skill";
-import { formatKnowledgeMarkdown } from "./lifemind-presentation";
+import { formatKnowledgeMarkdown, normalizeFormulaExpression } from "./lifemind-presentation";
 import { effectiveSourceCharacterCount } from "./lifemind-source-structure";
 
 export {
@@ -55,6 +58,7 @@ export {
 export type IntakeSourceType = "text" | "markdown" | "pdf" | "image" | "web" | "code";
 export type BatchStatus = "draft" | "confirmed" | "removed";
 export type KnowledgeGrain = "大颗粒度" | "中颗粒度" | "小颗粒度";
+export type PdfQualityStatus = "normal" | "warning" | "partial" | "blocked";
 export type RelationType =
   | "依赖"
   | "包含"
@@ -71,6 +75,57 @@ export type IntakeSource = {
   type: IntakeSourceType;
   content: string;
   stackHint?: string;
+  pdfQuality?: PdfQualityAssessment;
+  pdfEvidence?: PdfEvidence;
+};
+
+export type PdfEvidence = {
+  pages: PdfPageEvidence[];
+  images?: PdfEmbeddedImage[];
+};
+
+export type PdfEmbeddedImage = {
+  assetId: string;
+  page: number;
+  imageWidth: number;
+  imageHeight: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  imageDataUrl?: string;
+};
+
+export type PdfPageEvidence = {
+  page: number;
+  assetId?: string;
+  imageWidth: number;
+  imageHeight: number;
+  imageReviewRequired: boolean;
+  imageDataUrl?: string;
+  evidence: PdfEvidenceLine[];
+};
+
+export type PdfEvidenceLine = {
+  id: string;
+  text: string;
+  source: "pdf-text" | "vision-ocr";
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  confidence: number;
+  candidates: string[];
+};
+
+export type PdfQualityAssessment = {
+  qualityStatus: PdfQualityStatus;
+  difficultyRatio: number;
+  difficultCharacterCount: number;
+  totalCharacterCount: number;
+  requiresManualReview: boolean;
+  criticalUnresolved: string[];
+  textLayerLowQuality?: boolean;
 };
 
 export type Correction = {
@@ -116,11 +171,20 @@ export type PreviewFile = {
 export type PreparedPdfExtractedContent = {
   content: string;
   warnings: string[];
+  quality: PdfQualityAssessment;
 };
 
 export type VaultWriteFile = {
   path: string;
   content: string;
+  noteId: string;
+  title: string;
+  binary?: boolean;
+};
+
+export type VaultAssetFile = {
+  path: string;
+  dataUrl: string;
   noteId: string;
   title: string;
 };
@@ -137,38 +201,177 @@ type CreateReviewBatchOptions = {
   now?: Date;
   vaultContext?: VaultKnowledgeContext | null;
   externalReferenceTitles?: string[];
+  allowTrustedDerivedPaths?: boolean;
+  allowedPdfImageEvidence?: ReviewAnalysisValidationOptions["allowedPdfImageEvidence"];
 };
 
 const javaPrintOriginal = "print 会自动换行，println 主要用于不换行输出。";
 const pythonAppendOriginal = "append 会返回一个新的列表。";
 const sqlWhereOriginal = "where count(*) > 3";
 
-export function preparePdfExtractedContent(title: string, content: string): PreparedPdfExtractedContent {
+export function preparePdfExtractedContent(
+  title: string,
+  content: string,
+  pdfEvidence?: PdfEvidence,
+  qualityContent?: string,
+  textLayerLowQuality = false,
+): PreparedPdfExtractedContent {
   const normalizedContent = content.trim();
+  const normalizedQualityContent = (qualityContent ?? content).trim();
+  const measuredQuality = assessPdfExtractionQuality(normalizedQualityContent);
+  const quality: PdfQualityAssessment = textLayerLowQuality
+    ? {
+        ...measuredQuality,
+        qualityStatus: measuredQuality.qualityStatus === "normal" ? "warning" : measuredQuality.qualityStatus,
+        requiresManualReview: true,
+        textLayerLowQuality: true,
+      }
+    : measuredQuality;
+  const noisyExtraction = isNoisyPdfExtraction(normalizedQualityContent);
+  const hasVisualEvidence = Boolean(
+    pdfEvidence?.pages.some((page) => page.imageReviewRequired && page.imageDataUrl),
+  );
+  const warnings = buildPdfQualityWarnings(quality, noisyExtraction, hasVisualEvidence);
 
-  if (!isNoisyPdfExtraction(normalizedContent)) {
+  if (!noisyExtraction && quality.qualityStatus === "normal" && !quality.requiresManualReview) {
     return {
       content: normalizedContent,
-      warnings: [],
+      warnings,
+      quality,
     };
   }
-
-  const warning = "检测到这可能是手写或扫描笔记，PDF 文本层存在错字、拆字或乱码。";
 
   return {
     content: [
       "【PDF 抽取质量提示】",
-      "- 这份 PDF 可能是手写或扫描笔记；以下正文来自 PDF 文本层提取，可能存在错别字、拆字、乱码和技术名误识别。",
+      textLayerLowQuality
+        ? "- PDF 文本层存在公式结构或字符映射异常，已从正文和逐行证据中移除；请检查随请求发送的原始页面图像。"
+        : "- 这份 PDF 可能是手写或扫描笔记；以下正文来自 PDF 文本层提取，可能存在错别字、拆字、乱码和技术名误识别。",
       "- 审理时请结合技术栈提示、上下文和常见嵌入式术语进行语义纠偏，例如 STM32、UART、GPIO、ADC、DMA、PWM、TIM、I2C、SPI、PID 等。",
       "- 不要逐字照搬识别噪声；无法确认的内容放入 uncertain，不要编造成确定知识。",
+      `- 本地质量阀门：困难文字占比约 ${Math.round(quality.difficultyRatio * 100)}%，当前状态为 ${pdfQualityStatusLabel(quality)}。`,
+      ...(quality.qualityStatus === "partial" ? ["- 只允许对可确认内容进行部分审理，困难片段必须放入 uncertain。"] : []),
+      ...(quality.qualityStatus === "blocked"
+        ? ["- 困难文字超过 50%；先结合对应原始页图像进行视觉复核，只能把视觉明确确认的片段用于确定知识；无法确认的内容放入 uncertain。"]
+        : []),
+      ...(quality.criticalUnresolved.length > 0
+        ? ["- 以下关键结构包含无法确认的文字，必须人工复核，不得当作确定公式、定义或关系：", ...quality.criticalUnresolved.map((line) => `  - ${line}`)]
+        : []),
       "",
       `【PDF 文件名】${title.trim() || "未命名 PDF"}`,
       "",
       "【PDF 抽取正文】",
       normalizedContent,
     ].join("\n"),
-    warnings: [warning],
+    warnings,
+    quality,
   };
+}
+
+export function assessPdfExtractionQuality(content: string): PdfQualityAssessment {
+  const normalizedContent = content.trim();
+  const compact = normalizedContent.replace(/\s+/gu, "");
+  const totalCharacterCount = Array.from(compact).length;
+  const difficultCharacterCount = countDifficultPdfCharacters(compact);
+  const difficultyRatio = totalCharacterCount === 0 ? 0 : difficultCharacterCount / totalCharacterCount;
+  const qualityStatus = getPdfQualityStatus(difficultyRatio);
+  const criticalUnresolved = normalizedContent
+    .split(/\r?\n/gu)
+    .map((line) => line.trim())
+    .filter((line) => line && hasDifficultPdfSignal(line) && isCriticalPdfLine(line))
+    .slice(0, 8);
+
+  return {
+    qualityStatus,
+    difficultyRatio,
+    difficultCharacterCount,
+    totalCharacterCount,
+    requiresManualReview: qualityStatus !== "normal" || criticalUnresolved.length > 0,
+    criticalUnresolved,
+  };
+}
+
+function countDifficultPdfCharacters(content: string) {
+  const directDifficultCharacters = Array.from(content).filter((character) =>
+    /[�□\u2f00-\u2fdf]/u.test(character),
+  ).length;
+  const difficultTokens = [
+    /\(cid:\d+\)/giu,
+    /\b(?:STM\s*2B|VABT|MCV|ABM|OI[O0]|GTM|APC\s*DMA|SADC)\b/giu,
+    /(?:⾁\s*核|串叫|输⼊输出|被控[⼜又]对象)/gu,
+  ];
+  const difficultTokenCharacters = difficultTokens.reduce(
+    (count, pattern) => count + (content.match(pattern) ?? []).reduce((total, token) => total + Array.from(token).length, 0),
+    0,
+  );
+
+  return Math.min(Array.from(content).length, directDifficultCharacters + difficultTokenCharacters);
+}
+
+function hasDifficultPdfSignal(line: string) {
+  return countDifficultPdfCharacters(line.replace(/\s+/gu, "")) > 0;
+}
+
+function isCriticalPdfLine(line: string) {
+  return (
+    /(?:公式|定义|原理|关系|依赖|箭头|步骤|核心|定理)/u.test(line) ||
+    /^(?:#{1,6}\s+|(?:[一二三四五六七八九十百]+[、.．]|\d+[.)、．]))/u.test(line) ||
+    /(?:=|->|→|=>|≤|≥|∑|∫|√)/u.test(line)
+  );
+}
+
+function getPdfQualityStatus(difficultyRatio: number): PdfQualityStatus {
+  if (difficultyRatio > 0.5) return "blocked";
+  if (difficultyRatio > 0.3) return "partial";
+  if (difficultyRatio > 0.2) return "warning";
+  return "normal";
+}
+
+function pdfQualityStatusLabel(quality: PdfQualityAssessment) {
+  if (quality.textLayerLowQuality) return "PDF 文本层结构异常，需按页面图像复核";
+
+  switch (quality.qualityStatus) {
+    case "warning":
+      return "允许审理但需提示风险（20%～30%）";
+    case "partial":
+      return "仅部分审理（30%～50%）";
+    case "blocked":
+      return "禁止生成确定知识（超过 50%）";
+    default:
+      return "正常审理（不超过 20%）";
+  }
+}
+
+function buildPdfQualityWarnings(
+  quality: PdfQualityAssessment,
+  noisyExtraction: boolean,
+  hasVisualEvidence = false,
+) {
+  const warnings: string[] = [];
+
+  if (noisyExtraction) {
+    warnings.push("检测到这可能是手写或扫描笔记，PDF 文本层存在错字、拆字或乱码。");
+  }
+
+  if (quality.textLayerLowQuality) {
+    warnings.push("Rust PDF 文本层检测到公式或字符映射异常；确定知识必须以页面图像复核为准。");
+  } else if (quality.qualityStatus === "warning") {
+    warnings.push("PDF 困难文字占比处于 20%～30% 区间，允许审理但需要提示风险。");
+  } else if (quality.qualityStatus === "partial") {
+    warnings.push("PDF 困难文字占比处于 30%～50% 区间，只允许对可确认内容进行部分审理。");
+  } else if (quality.qualityStatus === "blocked") {
+    warnings.push("PDF 困难文字超过 50%，禁止生成确定知识。");
+  }
+
+  if (quality.criticalUnresolved.length > 0) {
+    warnings.push("PDF 的关键公式、标题、定义或关系存在无法确认的文字，必须人工复核。");
+  }
+
+  if (quality.requiresManualReview && hasVisualEvidence) {
+    warnings.push("对应 PDF 页面图像已附带到模型请求，可用于视觉复核。");
+  }
+
+  return warnings;
 }
 
 function isNoisyPdfExtraction(content: string) {
@@ -210,6 +413,7 @@ export function createReviewBatch(
         ...(options.vaultContext?.roots.map((root) => root.name) ?? []),
         ...localSkillOutput.relations.flatMap((relation) => [relation.source, relation.target]),
       ],
+      allowTrustedDerivedPaths: true,
     },
   );
 }
@@ -376,6 +580,9 @@ export function createReviewBatchFromAnalysisPlan(
     knownRootNames: options.vaultContext?.roots.map((root) => root.name) ?? [],
     taxonomyCandidates: buildTaxonomyCandidates(normalizeVaultContext(options.vaultContext)),
     vaultIndex,
+    allowedPdfImageEvidence: options.allowedPdfImageEvidence,
+    allowTrustedDerivedPaths: options.allowTrustedDerivedPaths,
+    allowLegacyPathCompatibility: true,
   };
   const validation = validateReviewAnalysisPlan(analysisPlan, normalizedSources, validationOptions);
 
@@ -387,15 +594,22 @@ export function createReviewBatchFromAnalysisPlan(
   const stackBySourceId = new Map(
     validation.output.stackDecisions.map((decision) => [decision.sourceId, decision.name]),
   );
-  const draftNotes = validation.output.sections.map((section) =>
+  const numberedSections = applyPdfSectionNumbers(
+    validation.output.sections,
+    normalizedSources,
+    validation.output.pageCoverage,
+    options.vaultContext,
+  );
+  const draftNotes = numberedSections.map((section) =>
     compileAnalysisSection(
       section,
       stackBySourceId.get(section.sourceId) ?? "未归类",
       vaultIndex,
+      normalizedSources.find((source) => source.id === section.sourceId),
     ),
   );
   const organizationAlignedNotes = draftNotes.map((note) => {
-    const section = validation.output.sections.find((candidate) => candidate.id === note.id);
+    const section = numberedSections.find((candidate) => candidate.id === note.id);
 
     if (section?.placement) return note;
 
@@ -405,16 +619,19 @@ export function createReviewBatchFromAnalysisPlan(
       options.vaultContext ?? null,
     )[0] ?? note;
   });
-  const pathNormalizedNotes = organizationAlignedNotes.map(normalizeGeneratedNotePath);
+  const pathNormalizedNotes = organizationAlignedNotes.map((note) => {
+    const section = numberedSections.find((candidate) => candidate.id === note.id);
+    return section?.placement ? note : normalizeGeneratedNotePath(note);
+  });
   const topicFolderPlan = applyAnalysisTopicFolderGrouping(
     pathNormalizedNotes,
-    validation.output.sections,
+    numberedSections,
     validation.output.relations,
     normalizedSources,
     vaultIndex,
     options.vaultContext ?? null,
   );
-  const usesNodePlacement = validation.output.sections.some((section) => section.placement);
+  const usesNodePlacement = numberedSections.some((section) => section.placement);
   const promotionPlan = usesNodePlacement
     ? { notes: topicFolderPlan.notes, moves: [], relations: [] }
     : applyExistingTopicPromotions(
@@ -422,18 +639,24 @@ export function createReviewBatchFromAnalysisPlan(
         normalizedSources,
         options.vaultContext ?? null,
       );
-  const uniqueNotes = ensureUniqueGeneratedNoteTargets(promotionPlan.notes);
+  const numberedPdfNotes = applyNumberedPdfTopicFolders(
+    promotionPlan.notes,
+    numberedSections,
+    normalizedSources,
+    validation.output.pageCoverage,
+  );
+  const uniqueNotes = ensureUniqueGeneratedNoteTargets(numberedPdfNotes);
   const moves = dedupeVaultMoveFiles([...topicFolderPlan.moves, ...promotionPlan.moves]);
   const relationCandidates = [
-    ...validation.output.sections.flatMap((section) =>
+    ...numberedSections.flatMap((section) =>
       section.parentId
         ? [{ type: "包含" as const, source: section.parentId, target: section.id }]
         : [],
     ),
     ...validation.output.relations.map((relation) => ({
       type: relation.type,
-      source: resolveAnalysisReference(relation.source, validation.output.sections, uniqueNotes),
-      target: resolveAnalysisReference(relation.target, validation.output.sections, uniqueNotes),
+      source: resolveAnalysisReference(relation.source, numberedSections, uniqueNotes),
+      target: resolveAnalysisReference(relation.target, numberedSections, uniqueNotes),
       ...(relation.sourceNodeId ? { sourceNodeId: relation.sourceNodeId } : {}),
       ...(relation.targetNodeId ? { targetNodeId: relation.targetNodeId } : {}),
     })),
@@ -511,6 +734,8 @@ export function adaptReviewSkillOutputToAnalysisPlan(
         : {}),
       status: note.status,
       body: note.markdown,
+      formulas: [],
+      imagePlacements: [],
       evidence: ["兼容 v1 笔记内容"],
     };
   });
@@ -534,6 +759,7 @@ function compileAnalysisSection(
   section: ReviewAnalysisSection,
   stack: string,
   vaultIndex: VaultKnowledgeNode[] = [],
+  source?: IntakeSource,
 ): GeneratedNote {
   const modelRelativePath = section.placement
     ? resolvePlacementRelativePath(section.placement, stack, vaultIndex)
@@ -550,8 +776,307 @@ function compileAnalysisSection(
     grain: section.grain,
     path: [stack, ...relativePath].join(" / "),
     status: section.status,
-    markdown: section.body,
+    markdown: compileAnalysisSectionMarkdown(section, source),
   };
+}
+
+function compileAnalysisSectionMarkdown(section: ReviewAnalysisSection, source?: IntakeSource) {
+  let body = source?.type === "pdf" ? removePdfBodyImages(section.body) : section.body;
+
+  for (const formula of section.formulas) {
+    const marker = `{{formula:${formula.id}}}`;
+    const rendered = renderAnalysisFormula(formula);
+    body = body.split(marker).join(rendered);
+  }
+
+  const placements = section.imagePlacements.map((placement) => ({
+    placement,
+    markdown: renderAnalysisImagePlacement(placement, source),
+  }));
+
+  for (const item of placements.filter(({ placement }) => placement.placement === "inline")) {
+    if (item.placement.anchor) {
+      body = body.split(item.placement.anchor).join(item.markdown);
+    }
+  }
+
+  const before = placements
+    .filter(({ placement }) => placement.placement === "before-section")
+    .map(({ markdown }) => markdown);
+  const after = placements
+    .filter(({ placement }) => placement.placement === "after-section")
+    .map(({ markdown }) => markdown);
+
+  return [...before, body, ...after].filter((part) => part.trim().length > 0).join("\n\n");
+}
+
+function removePdfBodyImages(body: string) {
+  return body
+    .replace(/!\[\[[^\]]*\]\]/gu, "")
+    .replace(/!\[[^\]]*\]\([^\n)]*\)/gu, "")
+    .replace(/<img\b[^>]*>/giu, "");
+}
+
+function applyPdfSectionNumbers(
+  sections: ReviewAnalysisSection[],
+  sources: IntakeSource[],
+  pageCoverage?: ReviewAnalysisPageCoverage[],
+  vaultContext?: VaultKnowledgeContext | null,
+) {
+  const pdfSourceIds = new Set(sources.filter((source) => source.type === "pdf").map((source) => source.id));
+  const chapterBySource = new Map<string, string>();
+  const countBySourceAndChapter = new Map<string, number>();
+  const sectionById = new Map(sections.map((section) => [section.id, section]));
+  const pageRankBySectionId = new Map<string, number>();
+
+  for (const coverage of pageCoverage ?? []) {
+    for (const sectionId of coverage.sectionIds) {
+      const current = pageRankBySectionId.get(sectionId);
+      if (current === undefined || coverage.page < current) pageRankBySectionId.set(sectionId, coverage.page);
+    }
+  }
+  const orderedIds = sections
+    .map((section, index) => ({ id: section.id, index, page: pageRankBySectionId.get(section.id) ?? Number.MAX_SAFE_INTEGER }))
+    .sort((left, right) => left.page - right.page || left.index - right.index)
+    .map((item) => item.id);
+  const numberedTitles = new Map<string, string>();
+  const existingNumberByChapter = collectExistingPdfNumbers(vaultContext, sources);
+  const existingTopicsBySource = collectExistingPdfTopics(vaultContext, sources);
+
+  for (const sectionId of orderedIds) {
+    const section = sectionById.get(sectionId);
+    if (!section) continue;
+    if (!pdfSourceIds.has(section.sourceId)) {
+      numberedTitles.set(section.id, section.title);
+      continue;
+    }
+    const explicitChapter = extractChapterNumber(section.title);
+    if (explicitChapter) {
+      chapterBySource.set(section.sourceId, explicitChapter);
+      numberedTitles.set(section.id, section.title);
+      continue;
+    }
+
+    const existingNumber = /^(\d+)(?:\.(\d+))?\s+/u.exec(section.title.trim());
+    if (existingNumber) {
+      const chapter = existingNumber[1];
+      chapterBySource.set(section.sourceId, chapter);
+      if (existingNumber[2]) {
+        const key = `${section.sourceId}:${chapter}`;
+        countBySourceAndChapter.set(key, Math.max(countBySourceAndChapter.get(key) ?? 0, Number(existingNumber[2])));
+      }
+      numberedTitles.set(section.id, section.title);
+      continue;
+    }
+
+    const parent = section.parentId ? sectionById.get(section.parentId) : undefined;
+    const parentChapter = parent ? extractChapterNumber(parent.title) : undefined;
+    const matchingExistingChapter = findMatchingExistingChapter(
+      section,
+      existingTopicsBySource.get(section.sourceId),
+    );
+    const previousSection = sections
+      .slice(0, sections.indexOf(section))
+      .reverse()
+      .find((candidate) => candidate.sourceId === section.sourceId && pdfSourceIds.has(candidate.sourceId));
+    const sameLocalPath = Boolean(
+      previousSection &&
+        (previousSection.path ?? []).join("/") === (section.path ?? []).join("/"),
+    );
+    const chapter =
+      parentChapter ??
+      matchingExistingChapter ??
+      (existingNumberByChapter.get(section.sourceId)?.size
+        ? sameLocalPath
+          ? chapterBySource.get(section.sourceId) ?? "1"
+          : inferNextPdfChapter(existingNumberByChapter.get(section.sourceId))
+        : chapterBySource.get(section.sourceId) ?? "1");
+    chapterBySource.set(section.sourceId, chapter);
+    const key = `${section.sourceId}:${chapter}`;
+    const next = Math.max(
+      (countBySourceAndChapter.get(key) ?? 0) + 1,
+      (existingNumberByChapter.get(section.sourceId)?.get(chapter) ?? 0) + 1,
+    );
+    countBySourceAndChapter.set(key, next);
+    numberedTitles.set(section.id, `${chapter}.${next} ${section.title}`);
+  }
+
+  return sections.map((section) => ({ ...section, ...(numberedTitles.has(section.id) ? { title: numberedTitles.get(section.id) } : {}) }));
+}
+
+function collectExistingPdfTopics(
+  vaultContext: VaultKnowledgeContext | null | undefined,
+  sources: IntakeSource[],
+) {
+  const result = new Map<string, Array<{ chapter: string; title: string; path: string }>>();
+  for (const source of sources) {
+    const root = normalizeComparableText(source.stackHint?.split(/[\\/]/)[0] ?? "");
+    const notes = (vaultContext?.notes ?? [])
+      .filter((note) => normalizeComparableText(note.root) === root)
+      .flatMap((note) => {
+        const chapter = note.title.match(/^(\d+)\./u)?.[1];
+        return chapter
+          ? [{
+              chapter,
+              title: note.title.replace(/^\d+\.\d+\s*/u, ""),
+              path: note.path,
+            }]
+          : [];
+      });
+    if (notes.length) result.set(source.id, notes);
+  }
+  return result;
+}
+
+function findMatchingExistingChapter(
+  section: ReviewAnalysisSection,
+  topics: Array<{ chapter: string; title: string; path: string }> | undefined,
+) {
+  const normalizedTitle = normalizeComparableText(section.title);
+  const sectionPath = (section.path ?? []).map(normalizeComparableText).filter(Boolean);
+  return topics?.find((topic) => {
+    const normalizedTopicTitle = normalizeComparableText(topic.title);
+    const titleMatch = normalizedTitle.includes(normalizedTopicTitle) || normalizedTopicTitle.includes(normalizedTitle);
+    const pathMatch = sectionPath.some((segment) => normalizeComparableText(topic.path).includes(segment));
+    return titleMatch || pathMatch;
+  })?.chapter;
+}
+
+function collectExistingPdfNumbers(
+  vaultContext: VaultKnowledgeContext | null | undefined,
+  sources: IntakeSource[],
+) {
+  const result = new Map<string, Map<string, number>>();
+  const roots = new Set(sources.filter((source) => source.type === "pdf").map((source) => normalizeComparableText(source.stackHint?.split(/[\\/]/)[0] ?? "")));
+  for (const note of vaultContext?.notes ?? []) {
+    if (!roots.has(normalizeComparableText(note.root))) continue;
+    const match = /^(\d+)\.(\d+)\s+/u.exec(note.title.trim());
+    if (!match) continue;
+    const chapters = result.get(note.root) ?? new Map<string, number>();
+    chapters.set(match[1], Math.max(chapters.get(match[1]) ?? 0, Number(match[2])));
+    result.set(note.root, chapters);
+  }
+  const bySource = new Map<string, Map<string, number>>();
+  for (const source of sources) {
+    const chapters = result.get(source.stackHint?.split(/[\\/]/)[0] ?? "");
+    if (chapters) bySource.set(source.id, chapters);
+  }
+  return bySource;
+}
+
+function inferNextPdfChapter(existing: Map<string, number> | undefined) {
+  if (!existing || existing.size === 0) return "1";
+  return String(Math.max(...existing.keys().map(Number)) + 1);
+}
+
+function extractChapterNumber(title: string) {
+  const normalized = title.trim();
+  const arabic = /(?:第\s*)?(\d+)\s*章/u.exec(normalized);
+  if (arabic) return arabic[1];
+
+  const chinese = /第\s*([一二三四五六七八九十百零〇两]+)\s*章/u.exec(normalized)?.[1];
+  if (!chinese) return undefined;
+
+  const digits: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (chinese === "十") return "10";
+  if (chinese.includes("十")) {
+    const [tens, ones] = chinese.split("十");
+    return String((tens ? (digits[tens] ?? 0) : 1) * 10 + (ones ? digits[ones] ?? 0 : 0));
+  }
+  return String(digits[chinese] ?? Number(chinese));
+}
+
+function renderAnalysisFormula(formula: ReviewAnalysisFormula) {
+  const latex = normalizeFormulaExpression(formula.latex);
+
+  return formula.display === "block" ? `$$\n${latex}\n$$` : `$${latex}$`;
+}
+
+function renderAnalysisImagePlacement(placement: ReviewAnalysisImagePlacement, source?: IntakeSource) {
+  const image = source?.pdfEvidence?.images?.find((candidate) => candidate.assetId === placement.assetId);
+  if (!image?.imageDataUrl) return "";
+  const extension = image.imageDataUrl.startsWith("data:image/png;") ? "png" : "jpg";
+  const defaultAlt = `${source?.title ?? "PDF"}第 ${placement.sourcePage} 页图片`;
+  const alt = (placement.alt ?? placement.caption ?? defaultAlt).trim() || defaultAlt;
+  const markdownImage = `![[附件/PDF图片/${safePathSegment(placement.assetId)}.${extension}]]`;
+
+  return placement.caption && placement.caption.trim() && placement.caption.trim() !== alt
+    ? `${markdownImage}\n*${placement.caption.trim()}*`
+    : markdownImage;
+}
+
+function applyNumberedPdfTopicFolders(
+  notes: GeneratedNote[],
+  sections: ReviewAnalysisSection[],
+  sources: IntakeSource[],
+  pageCoverage?: ReviewAnalysisPageCoverage[],
+) {
+  const pdfSourceIds = new Set(sources.filter((source) => source.type === "pdf").map((source) => source.id));
+  if (pdfSourceIds.size === 0 || notes.length === 0) return notes;
+
+  const sectionById = new Map(sections.map((section) => [section.id, section]));
+  const noteById = new Map(notes.map((note) => [note.id, note]));
+  const parentById = new Map(sections.map((section) => [section.id, section.parentId]));
+  const firstPageBySection = new Map<string, number>();
+
+  for (const coverage of pageCoverage ?? []) {
+    if (coverage.status !== "covered") continue;
+    for (const sectionId of coverage.sectionIds) {
+      const current = firstPageBySection.get(sectionId);
+      if (current === undefined || coverage.page < current) firstPageBySection.set(sectionId, coverage.page);
+    }
+  }
+  const resultByNoteId = new Map<string, GeneratedNote>();
+  for (const sourceId of pdfSourceIds) {
+    const sourceSections = sections.filter((section) => section.sourceId === sourceId);
+    const topicIdBySection = new Map<string, string>();
+
+    for (const section of sourceSections) {
+      let topic = section;
+      const visited = new Set<string>();
+      while (topic.parentId && !visited.has(topic.parentId)) {
+        visited.add(topic.parentId);
+        const parent = sectionById.get(topic.parentId);
+        if (!parent || extractChapterNumber(parent.title)) break;
+        topic = parent;
+      }
+      topicIdBySection.set(section.id, topic.id);
+    }
+
+    const topicPages = new Map<string, number>();
+    for (const section of sourceSections) {
+      const topicId = topicIdBySection.get(section.id) ?? section.id;
+      const page = firstPageBySection.get(section.id) ?? Number.MAX_SAFE_INTEGER;
+      topicPages.set(topicId, Math.min(topicPages.get(topicId) ?? Number.MAX_SAFE_INTEGER, page));
+    }
+    const topicIds = [...topicPages.keys()].sort((left, right) =>
+      (topicPages.get(left) ?? Number.MAX_SAFE_INTEGER) - (topicPages.get(right) ?? Number.MAX_SAFE_INTEGER) ||
+      sourceSections.findIndex((section) => section.id === left) - sourceSections.findIndex((section) => section.id === right),
+    );
+
+    topicIds.forEach((topicId, index) => {
+      const topicTitle = stripPdfSectionNumber(sectionById.get(topicId)?.title ?? "未分类主题") || "未分类主题";
+      const folderName = `${String(index + 1).padStart(2, "0")}-${topicTitle}`;
+      for (const [sectionId, mappedTopicId] of topicIdBySection) {
+        if (mappedTopicId !== topicId) continue;
+        const note = noteById.get(sectionId);
+        if (!note) continue;
+
+        const segments = splitLogicalNotePath(note.path);
+        const root = segments.shift() ?? "未归类";
+        const relative = segments.filter((segment, relativeIndex) =>
+          !(relativeIndex === 0 && (normalizeComparableText(segment) === normalizeComparableText(topicTitle) || normalizeComparableText(segment) === normalizeComparableText(folderName))),
+        );
+        resultByNoteId.set(note.id, { ...note, path: [root, folderName, ...relative].join(" / ") });
+      }
+    });
+  }
+
+  return notes.map((note) => resultByNoteId.get(note.id) ?? note);
+}
+
+function stripPdfSectionNumber(title: string) {
+  return title.replace(/^\d+(?:\.\d+)*\s*/u, "").trim();
 }
 
 function resolvePlacementRelativePath(
@@ -622,7 +1147,15 @@ export function buildPreviewFiles(batch: ReviewBatch): PreviewFile[] {
       path: notePreviewPath(note),
       content: note.markdown,
     })),
+    ...buildPdfAssetPreviewFiles(batch),
   ];
+}
+
+export function buildPdfAssetPreviewFiles(batch: ReviewBatch): PreviewFile[] {
+  return buildPdfAssetFiles(batch).map((asset) => ({
+    path: asset.path,
+    content: asset.dataUrl,
+  }));
 }
 
 export function buildBatchPreviewRoot(parentRoot: string, batchId: string) {
@@ -639,12 +1172,53 @@ export function notePreviewPath(note: GeneratedNote) {
 }
 
 export function buildVaultWriteFiles(batch: ReviewBatch): VaultWriteFile[] {
-  return batch.notes.map((note) => ({
-    path: noteVaultPath(note),
-    content: note.markdown,
-    noteId: note.id,
-    title: note.title,
-  }));
+  return [
+    ...batch.notes.map((note) => ({
+      path: noteVaultPath(note),
+      content: note.markdown,
+      noteId: note.id,
+      title: note.title,
+    })),
+    ...buildPdfAssetFiles(batch).map((asset) => ({
+      path: asset.path,
+      content: asset.dataUrl,
+      noteId: asset.noteId,
+      title: asset.title,
+      binary: true,
+    })),
+  ];
+}
+
+export function buildVaultAssetFiles(batch: ReviewBatch): VaultAssetFile[] {
+  return buildPdfAssetFiles(batch);
+}
+
+function buildPdfAssetFiles(batch: ReviewBatch): VaultAssetFile[] {
+  const assets = new Map<string, VaultAssetFile>();
+  const referencedAssetIds = new Set<string>();
+  for (const note of batch.notes) {
+    for (const match of note.markdown.matchAll(/!\[\[附件\/PDF图片\/([^\]]+)\]\]/gu)) {
+      const assetId = /^(.*)\.(?:png|jpe?g)$/iu.exec(match[1] ?? "")?.[1];
+      if (assetId) referencedAssetIds.add(assetId);
+    }
+  }
+
+  for (const source of batch.sources) {
+    if (source.type !== "pdf") continue;
+    for (const image of source.pdfEvidence?.images ?? []) {
+      if (!image.imageDataUrl || !referencedAssetIds.has(image.assetId) || !/^data:image\/(?:png|jpe?g);base64,/iu.test(image.imageDataUrl)) continue;
+      const extension = image.imageDataUrl.startsWith("data:image/png;") ? "png" : "jpg";
+      const assetId = image.assetId;
+      assets.set(assetId, {
+        path: `附件/PDF图片/${safePathSegment(assetId)}.${extension}`,
+        dataUrl: image.imageDataUrl,
+        noteId: `${batch.id}-${assetId}`,
+        title: `${source.title} 第 ${image.page} 页图片`,
+      });
+    }
+  }
+
+  return [...assets.values()];
 }
 
 export function buildVaultMoveFiles(batch: ReviewBatch): VaultMoveFile[] {
@@ -664,7 +1238,9 @@ function buildRootGuideFiles(batch: ReviewBatch, mode: GuideMode): VaultWriteFil
   return [...groups.entries()].map(([root, notes]) => {
     const title = `${root} 导览`;
     const safeRoot = safePathSegment(root);
-    const pathPrefix = mode === "preview" ? `20-生成预览/${safeRoot}` : safeRoot;
+    const pathPrefix = mode === "preview"
+      ? `20-生成预览/${safeRoot}/00-导览`
+      : `${safeRoot}/00-导览`;
 
     return {
       path: `${pathPrefix}/00-${safeFileName(title)}.md`,
