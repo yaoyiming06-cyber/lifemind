@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ArchiveRestore from "lucide-react/dist/esm/icons/archive-restore.mjs";
@@ -13,16 +13,17 @@ import GitBranch from "lucide-react/dist/esm/icons/git-branch.mjs";
 import KeyRound from "lucide-react/dist/esm/icons/key-round.mjs";
 import Link2 from "lucide-react/dist/esm/icons/link-2.mjs";
 import NotebookTabs from "lucide-react/dist/esm/icons/notebook-tabs.mjs";
+import PanelLeft from "lucide-react/dist/esm/icons/panel-left.mjs";
 import ScanLine from "lucide-react/dist/esm/icons/scan-line.mjs";
 import Settings2 from "lucide-react/dist/esm/icons/settings-2.mjs";
-import Sparkles from "lucide-react/dist/esm/icons/sparkles.mjs";
 import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.mjs";
 import UploadCloud from "lucide-react/dist/esm/icons/upload-cloud.mjs";
 import WandSparkles from "lucide-react/dist/esm/icons/wand-sparkles.mjs";
 import XCircle from "lucide-react/dist/esm/icons/x-circle.mjs";
-import { Dock, DockIcon, DockItem, DockLabel } from "@/components/ui/dock";
+import X from "lucide-react/dist/esm/icons/x.mjs";
+import { IslandNavigation } from "@/components/ui/island-navigation";
 import { LifemindMark } from "@/components/lifemind-mark";
-import { motion, AnimatePresence } from "@/lib/simple-motion";
+import { motion, AnimatePresence, useReducedMotion } from "@/lib/simple-motion";
 import {
   buildBatchPreviewRoot,
   buildPreviewFiles,
@@ -66,9 +67,41 @@ const navItems = [
 ] as const;
 
 type NavLabel = "入库" | "审理" | "扫描" | "设置";
+type WorkflowSidebarAction = "upload" | "review" | "preview" | "settings" | "scan";
+type WorkflowSidebarItem = {
+  id: string;
+  label: string;
+  icon: ComponentType<{ size?: number | string; strokeWidth?: number | string; className?: string; "aria-hidden"?: boolean | "true" | "false" }>;
+  action: WorkflowSidebarAction;
+};
 
-const intakeTabs = ["上传内容", "AI 结果", "Obsidian 预览"];
-const reviewTabs = ["上传内容", "AI 结果", "Obsidian 预览"];
+const workflowItemsByPage: Record<NavLabel, readonly WorkflowSidebarItem[]> = {
+  入库: [
+    { id: "upload", label: "上传内容", icon: FileInput, action: "upload" },
+    { id: "review", label: "AI 审理", icon: WandSparkles, action: "review" },
+    { id: "preview", label: "Obsidian 预览", icon: NotebookTabs, action: "preview" },
+    { id: "settings", label: "设置", icon: Settings2, action: "settings" },
+  ],
+  审理: [
+    { id: "batch", label: "当前批次", icon: Database, action: "review" },
+    { id: "review", label: "AI 审理", icon: WandSparkles, action: "review" },
+    { id: "preview", label: "Obsidian 预览", icon: NotebookTabs, action: "preview" },
+    { id: "intake", label: "返回入库", icon: FileInput, action: "upload" },
+  ],
+  扫描: [
+    { id: "logic", label: "逻辑连接", icon: ScanLine, action: "scan" },
+    { id: "range", label: "扫描范围", icon: GitBranch, action: "scan" },
+    { id: "settings", label: "设置", icon: Settings2, action: "settings" },
+    { id: "intake", label: "返回入库", icon: FileInput, action: "upload" },
+  ],
+  设置: [
+    { id: "vault", label: "Vault", icon: Database, action: "settings" },
+    { id: "model", label: "模型与 API", icon: KeyRound, action: "settings" },
+    { id: "review", label: "AI 审理", icon: WandSparkles, action: "review" },
+    { id: "intake", label: "返回入库", icon: FileInput, action: "upload" },
+  ],
+};
+
 type PreviewState = "idle" | "opening" | "opened" | "failed";
 type VaultCheckState = "idle" | "checking" | "checked" | "failed";
 
@@ -172,42 +205,19 @@ type PendingFileItem = {
   file?: File;
 };
 
-const pageMeta: Record<
-  NavLabel,
-  { eyebrow: string; title: string; metrics: string[]; panelTitle: string }
-> = {
-  入库: {
-    eyebrow: "等待上传学习材料",
-    title: "把文本和 Markdown 转成可审阅的 Obsidian 入库批次。",
-    metrics: ["文本输入", "Markdown", "人工确认"],
-    panelTitle: "上传内容 / AI 结果 / 预览",
-  },
-  审理: {
-    eyebrow: "AI 审理结果等待确认",
-    title: "把零散学习笔记整理成可跳转的 Obsidian 知识结构。",
-    metrics: ["3 篇笔记", "1 条纠错", "4 条关系"],
-    panelTitle: "审理结果 / 纠错 / 预览",
-  },
-  扫描: {
-    eyebrow: "全库关系维护",
-    title: "按时间范围扫描已入库笔记，补全父笔记里的后续枝节链接。",
-    metrics: ["时间排序", "LLM 复审", "确认写入"],
-    panelTitle: "逻辑连接更新",
-  },
-  设置: {
-    eyebrow: "本地配置",
-    title: "配置 Vault、审理 Skill、模型接入和隐私边界。",
-    metrics: ["Vault 已选择", "Skill 已启用", "模型未启用"],
-    panelTitle: "设置",
-  },
-};
-
 type LogicLinkRangePreset = "1d" | "7d" | "30d" | "all";
 type LogicLinkRunState = "idle" | "scanning" | "reviewing" | "ready" | "confirming" | "confirmed" | "failed";
 
 export default function Home() {
   const container = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
+  const focusBeforeMobileSidebarRef = useRef<HTMLElement | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.innerWidth > 760);
+  const [compactViewport, setCompactViewport] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const sourcePathHandlerRef = useRef<(paths: string[]) => void>(() => undefined);
   const previewRequestRef = useRef(0);
   const [activeNav, setActiveNav] = useState<NavLabel>("入库");
@@ -272,24 +282,18 @@ export default function Home() {
   const [logicLinkMessage, setLogicLinkMessage] = useState("");
   const [logicLinkPreviewState, setLogicLinkPreviewState] = useState<PreviewState>("idle");
   const [logicLinkLastManifest, setLogicLinkLastManifest] = useState<BatchManifest | null>(null);
-  const meta = pageMeta[activeNav];
+  const prefersReducedMotion = useReducedMotion() ?? false;
   const batchSources = reviewBatch?.sources ?? [];
   const batchNotes = reviewBatch?.notes ?? [];
   const batchCorrections = reviewBatch?.corrections ?? [];
   const batchRelations = reviewBatch?.relations ?? [];
   const pendingTextCount = pasteDraft.trim() ? 1 : 0;
   const pendingInputCount = pendingTextCount + pendingFileItems.length;
-  const pendingFileTypeSummary =
-    pendingFileItems.length > 0
-      ? Array.from(new Set(pendingFileItems.map((item) => sourceTypeLabel(item.type)))).join(" / ")
-      : "未选择文件";
-  const currentStackHintCopy = stackHint.trim() || "未填写，AI 将根据内容判断";
   const vaultWriteFiles = reviewBatch ? buildVaultWriteFiles(reviewBatch) : [];
   const vaultMoveFiles = reviewBatch ? buildVaultMoveFiles(reviewBatch) : [];
   const currentPreviewRoot = reviewBatch ? buildBatchPreviewRoot(previewVault.root, reviewBatch.id) : previewVault.root;
   const firstNote = batchNotes[0];
   const firstPathSegments = firstNote?.path.split("/").map((segment) => segment.trim()) ?? [];
-  const visibleTabs = activeNav === "审理" ? reviewTabs : intakeTabs;
   const logicLinkSuggestionCount = logicLinkDraft?.suggestions.length ?? 0;
   const reviewEngineLabel =
     reviewProvider === "local"
@@ -337,7 +341,11 @@ export default function Home() {
           ? `${pendingInputCount} 条待审理`
           : "等待上传文件"
       : activeNav === "扫描"
-        ? logicLinkRunState === "ready"
+        ? logicLinkRunState === "scanning"
+          ? "正在扫描"
+          : logicLinkRunState === "reviewing"
+            ? "正在审理"
+            : logicLinkRunState === "ready"
           ? `${logicLinkSuggestionCount} 条连接建议待确认`
           : logicLinkRunState === "confirming"
             ? "正在写入连接"
@@ -345,6 +353,16 @@ export default function Home() {
         : activeNav === "设置"
           ? "本地配置"
           : batchStatusLabel;
+  const islandStatus =
+    activeNav === "入库" && reviewRunState === "reviewing"
+      ? "正在审理"
+      : activeNav === "扫描" && logicLinkRunState === "scanning"
+        ? "正在扫描"
+        : activeNav === "扫描" && logicLinkRunState === "reviewing"
+          ? "正在审理"
+          : activeNav === "扫描" && logicLinkRunState === "confirming"
+            ? "正在写入"
+            : undefined;
   const writePlanCopy = writePlan
     ? `${writePlan.newCount} 条新建 / ${writePlan.overwriteCount} 条覆盖 / ${writePlan.moveCount} 条迁移`
     : vaultPath.trim() && reviewBatch
@@ -446,7 +464,7 @@ export default function Home() {
       setActiveTab("上传内容");
     }
     if (label === "审理") {
-      setActiveTab(reviewBatch ? "AI 结果" : "上传内容");
+      setActiveTab("AI 结果");
     }
   }
 
@@ -1460,42 +1478,140 @@ export default function Home() {
     container.current?.classList.add("app-ready");
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const query = window.matchMedia("(max-width: 760px)");
+    const updateViewport = () => {
+      const isCompact = query.matches;
+      setCompactViewport(isCompact);
+      // A desktop-open drawer must not remain modal when the viewport crosses
+      // into the mobile layout. Closing it also removes the mobile scrim.
+      if (isCompact) setSidebarOpen(false);
+    };
+    updateViewport();
+    query.addEventListener("change", updateViewport);
+    return () => query.removeEventListener("change", updateViewport);
+  }, []);
+
+  useEffect(() => {
+    workspaceRef.current?.scrollTo({ top: 0 });
+  }, [activeNav, activeTab]);
+
+  useEffect(() => {
+    if (!compactViewport || !sidebarOpen) return;
+
+    const focusableSelector = [
+      "button:not([disabled])",
+      "a[href]",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex=\"-1\"])",
+    ].join(",");
+    const handleMobileSidebarKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+        requestAnimationFrame(() => sidebarToggleRef.current?.focus());
+        return;
+      }
+      if (event.key !== "Tab" || !sidebarRef.current) return;
+      const focusable = Array.from(sidebarRef.current.querySelectorAll<HTMLElement>(focusableSelector));
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleMobileSidebarKeyDown);
+    requestAnimationFrame(() => {
+      const first = sidebarRef.current?.querySelector<HTMLElement>(focusableSelector);
+      first?.focus();
+    });
+    return () => document.removeEventListener("keydown", handleMobileSidebarKeyDown);
+  }, [compactViewport, sidebarOpen]);
+
+  function closeSidebar() {
+    setSidebarOpen(false);
+    if (compactViewport) requestAnimationFrame(() => sidebarToggleRef.current?.focus());
+  }
+
+  function toggleSidebar() {
+    if (sidebarOpen) {
+      closeSidebar();
+      return;
+    }
+    if (compactViewport) focusBeforeMobileSidebarRef.current = document.activeElement as HTMLElement | null;
+    setSidebarOpen(true);
+  }
+
+  function selectWorkflowItem(item: WorkflowSidebarItem) {
+    if (item.action === "settings") {
+      handleNavChange("设置");
+    } else if (item.action === "scan") {
+      handleNavChange("扫描");
+    } else if (item.action === "upload") {
+      handleNavChange("入库");
+      setActiveTab("上传内容");
+    } else if (item.action === "review") {
+      handleNavChange("审理");
+      setActiveTab("AI 结果");
+    } else {
+      handleNavChange(reviewBatch ? "审理" : "入库");
+      setActiveTab("Obsidian 预览");
+    }
+    if (compactViewport) closeSidebar();
+  }
+
+  const workflowPage = activeNav === "设置" ? "设置" : activeNav === "扫描" ? "" : activeTab === "AI 结果" ? "AI 审理" : activeTab;
+  const workspaceTitle = activeNav === "扫描" ? "逻辑连接" : activeNav === "设置" ? "设置" : workflowPage;
+  const workflowItems = workflowItemsByPage[activeNav];
+  const activeSidebarId =
+    activeNav === "入库"
+      ? activeTab === "AI 结果"
+        ? "review"
+        : activeTab === "Obsidian 预览"
+          ? "preview"
+          : "upload"
+      : activeNav === "审理"
+        ? activeTab === "Obsidian 预览"
+          ? "preview"
+          : "review"
+        : activeNav === "扫描"
+          ? "logic"
+          : "vault";
+
   return (
-    <main ref={container} className="app-shell">
-      <div className="ambient-line ambient-line-one" />
-      <div className="ambient-line ambient-line-two" />
-
+    <main ref={container} className="app-shell" data-sidebar-open={sidebarOpen}>
       <header className="app-chrome">
-        <div className="brand-lockup" aria-label="LifeMind">
-          <LifemindMark />
-          <div>
-            <p className="brand-name">LifeMind</p>
-            <p className="brand-caption">本地知识入库审阅台</p>
-          </div>
-        </div>
-
-        <nav className="top-dock-wrap" aria-label="主导航">
-          <Dock>
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              return (
-                <DockItem
-                  key={item.label}
-                  active={activeNav === item.label}
-                  ariaLabel={item.label}
-                  onClick={() => handleNavChange(item.label)}
-                >
-                  <DockLabel>{item.label}</DockLabel>
-                  <DockIcon>
-                    <Icon aria-hidden="true" strokeWidth={1.7} />
-                  </DockIcon>
-                </DockItem>
-              );
-            })}
-          </Dock>
-        </nav>
-
-        <div className="status-pill">
+        <button
+          ref={sidebarToggleRef}
+          type="button"
+          className="icon-button sidebar-toggle"
+          aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
+          aria-expanded={sidebarOpen}
+          aria-controls="workflow-sidebar"
+          title={sidebarOpen ? "收起侧栏" : "展开侧栏"}
+          onClick={toggleSidebar}
+        >
+          <PanelLeft size={20} strokeWidth={1.6} />
+        </button>
+        <IslandNavigation
+          items={navItems.map((item) => ({ ...item, id: item.label }))}
+          active={activeNav}
+          status={islandStatus}
+          statusTone="busy"
+          onNavigate={(id) => {
+            handleNavChange(id as NavLabel);
+            if (compactViewport) closeSidebar();
+          }}
+        />
+        <div className="status-pill" role="status">
           <span className="status-dot" data-state={batchStatus} />
           {statusPillCopy}
         </div>
@@ -1514,9 +1630,9 @@ export default function Home() {
         >
           <motion.div
             className="lifemind-loading-logo"
-            initial={{ scale: 0.94, y: 8 }}
-            animate={{ scale: [0.94, 1.02, 0.98], y: [8, 0, 4] }}
-            transition={{ duration: 1.8, repeat: Infinity, repeatType: "mirror", ease: "easeInOut" }}
+            initial={prefersReducedMotion ? false : { scale: 0.94, y: 8 }}
+            animate={prefersReducedMotion ? { scale: 1, y: 0 } : { scale: [0.94, 1.02, 0.98], y: [8, 0, 4] }}
+            transition={prefersReducedMotion ? { duration: 0 } : { duration: 1.8, repeat: Infinity, repeatType: "mirror", ease: "easeInOut" }}
           >
             <span className="loading-ring loading-ring-one" />
             <span className="loading-ring loading-ring-two" />
@@ -1526,26 +1642,60 @@ export default function Home() {
       )}
 
       <section className="workspace-grid">
-        <div className="main-panel workspace-panel">
+        {sidebarOpen && compactViewport && (
+          <button
+            type="button"
+            className="sidebar-scrim"
+            aria-label="关闭侧栏"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+        <aside
+          ref={sidebarRef}
+          id="workflow-sidebar"
+          className="workflow-sidebar"
+          aria-label="工作流程侧栏"
+          inert={compactViewport && !sidebarOpen ? true : undefined}
+        >
+          <button type="button" className="workspace-brand" aria-label="LifeMind，上传内容" onClick={() => selectWorkflowItem(workflowItemsByPage.入库[0])}>
+            <LifemindMark />
+            <span className="brand-name" lang="en">LifeMind</span>
+          </button>
+          <nav className="workflow-nav" aria-label={`${activeNav}侧栏`} data-page={activeNav}>
+            {workflowItems.map((item) => {
+              const Icon = item.icon;
+              const selected = activeSidebarId === item.id;
+              return (
+                <button
+                  type="button"
+                  key={item.label}
+                  aria-current={selected ? "page" : undefined}
+                  title={item.label}
+                  onClick={() => selectWorkflowItem(item)}
+                >
+                  <Icon size={19} strokeWidth={1.6} aria-hidden="true" />
+                  <span>{item.label}</span>
+                  {selected && <span className="workflow-active-mark" aria-hidden="true" />}
+                </button>
+              );
+            })}
+          </nav>
+          <div className="sidebar-vault">
+            <Database size={16} strokeWidth={1.5} aria-hidden="true" />
+            <div>
+              <span>Obsidian Vault</span>
+              <strong title={vaultPath}>{vaultPath.trim() ? vaultPath.split("/").filter(Boolean).at(-1) : "未连接"}</strong>
+            </div>
+          </div>
+        </aside>
+        <div ref={workspaceRef} className="main-panel workspace-panel" data-page={activeNav}>
           <div className="panel-head">
             <div>
-              <p className="panel-kicker">主工作区</p>
-              <h2>{meta.panelTitle}</h2>
+              <h1>{workspaceTitle}</h1>
             </div>
             {(activeNav === "入库" || activeNav === "审理") && (
               <div className="panel-actions">
-                <div className="tab-list" role="tablist" aria-label="主工作区切换">
-                  {visibleTabs.map((tab) => (
-                    <button
-                      key={tab}
-                      type="button"
-                      className={activeTab === tab ? "tab-active" : ""}
-                      onClick={() => setActiveTab(tab)}
-                    >
-                      {tab}
-                    </button>
-                  ))}
-                </div>
+                <span className="workspace-count">{activeNav === "入库" ? `${pendingInputCount} 条待审理` : `${batchNotes.length} 篇笔记`}</span>
                 {activeNav === "审理" && (
                   <button
                     type="button"
@@ -1565,82 +1715,43 @@ export default function Home() {
             {activeNav === "入库" && activeTab === "上传内容" && (
               <motion.div
                 key="input"
-                className="content-card input-drop"
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={handleDrop}
-                initial={{ opacity: 0, y: 14 }}
+                className="intake-workspace"
+                data-drag-active={dragActive}
+                onDragOver={(event) => { event.preventDefault(); setDragActive(true); }}
+                onDragLeave={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragActive(false);
+                }}
+                onDrop={(event) => { setDragActive(false); handleDrop(event); }}
+                initial={{ opacity: 1 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
+                exit={{ opacity: 0 }}
               >
-                <UploadCloud size={30} />
-                <h3>上传或粘贴学习材料</h3>
-                <p>文件会先加入待审理队列，点击开始审理后才解析 PDF、文本和代码内容。</p>
                 <div className="intake-form">
-                  <textarea
-                    value={pasteDraft}
-                    onChange={(event) => setPasteDraft(event.target.value)}
-                    placeholder="粘贴一段学习笔记、代码片段或 Markdown 内容"
-                    aria-label="粘贴学习材料"
-                    disabled={reviewRunState === "reviewing"}
-                  />
-                  <div className="web-intake-row">
-                    <input
-                      value={webUrlDraft}
-                      onChange={(event) => setWebUrlDraft(event.target.value)}
-                      placeholder="粘贴网页链接，例如 https://example.com/article"
-                      aria-label="网页链接"
+                  <div className="intake-editor">
+                    <label htmlFor="learning-material">学习材料</label>
+                    <textarea
+                      id="learning-material"
+                      value={pasteDraft}
+                      onChange={(event) => setPasteDraft(event.target.value)}
+                      placeholder="在这里写下或粘贴你的学习内容…"
+                      aria-label="粘贴学习材料"
                       disabled={reviewRunState === "reviewing"}
                     />
-                    <button
-                      type="button"
-                      className="secondary-action"
-                      disabled={reviewRunState === "reviewing"}
-                      onClick={handleWebUrlReview}
-                    >
-                      <Link2 size={16} />
-                      抓取网页
-                    </button>
-                  </div>
-                  <div className="intake-controls">
-                    <input
-                      value={stackHint}
-                      onChange={(event) => setStackHint(event.target.value)}
-                      placeholder="技术栈提示，例如 Java / Python / 数据库"
-                      aria-label="技术栈提示"
-                      disabled={reviewRunState === "reviewing"}
-                    />
-                    <input
-                      ref={fileInputRef}
-                      className="hidden-file-input"
-                      type="file"
-                      multiple
-                      onChange={handleFileInputChange}
-                    />
-                    <button
-                      type="button"
-                      className="secondary-action"
-                      disabled={reviewRunState === "reviewing"}
-                      onClick={() => void handleSelectFiles()}
-                    >
-                      <FileInput size={16} />
-                      选择文件
-                    </button>
-                    <button
-                      type="button"
-                      className="primary-action"
-                      disabled={reviewRunState === "reviewing"}
-                      onClick={() => void handleStartReview()}
-                    >
-                      <WandSparkles size={16} />
-                      {reviewRunState === "reviewing" ? "审理中" : "开始审理"}
-                    </button>
+                    {!pasteDraft && pendingFileItems.length === 0 && (
+                      <div className="editor-empty" aria-hidden="true">
+                        <LifemindMark />
+                        <span lang="en">Room for a new thought.</span>
+                        <span className="editor-empty-caption">文本 · Markdown · PDF</span>
+                      </div>
+                    )}
+                    {dragActive && <div className="drop-feedback"><UploadCloud size={28} /><span>放入学习材料</span></div>}
                   </div>
                   {pendingFileItems.length > 0 && (
                     <section className="pending-file-list" aria-label="待审理文件">
                       <div className="pending-file-list-head">
                         <strong>待审理文件</strong>
-                        <button type="button" disabled={reviewRunState === "reviewing"} onClick={clearPendingFiles}>
-                          清空
+                        <button type="button" className="text-action" disabled={reviewRunState === "reviewing"} onClick={clearPendingFiles}>
+                          清空文件
                         </button>
                       </div>
                       {pendingFileItems.map((item) => (
@@ -1654,17 +1765,50 @@ export default function Home() {
                           </div>
                           <button
                             type="button"
+                            className="icon-button"
+                            aria-label={`移除 ${item.title}`}
+                            title={`移除 ${item.title}`}
                             disabled={reviewRunState === "reviewing"}
                             onClick={() => removePendingFile(item.id)}
                           >
-                            移除
+                            <X size={16} />
                           </button>
                         </article>
                       ))}
                     </section>
                   )}
-                  {intakeError && <p className="intake-error">{intakeError}</p>}
-                  {reviewEngineMessage && <p className="intake-status">{reviewEngineMessage}</p>}
+                  {intakeError && <p className="intake-error" role="alert">{intakeError}</p>}
+                  {reviewEngineMessage && <p className="intake-status" role="status">{reviewEngineMessage}</p>}
+                  <details className="web-intake">
+                    <summary><Link2 size={15} aria-hidden="true" />网页链接</summary>
+                    <div className="web-intake-row">
+                      <label className="sr-only" htmlFor="web-url">网页链接</label>
+                      <input
+                        id="web-url"
+                        value={webUrlDraft}
+                        onChange={(event) => setWebUrlDraft(event.target.value)}
+                        placeholder="https://example.com/article"
+                        aria-label="网页链接"
+                        disabled={reviewRunState === "reviewing"}
+                      />
+                      <button type="button" className="secondary-action" disabled={reviewRunState === "reviewing"} onClick={handleWebUrlReview}>
+                        <Link2 size={16} />抓取网页
+                      </button>
+                    </div>
+                  </details>
+                  <div className="intake-controls">
+                    <div className="stack-hint-field">
+                      <label htmlFor="stack-hint">技术栈提示<span>可选</span></label>
+                      <input id="stack-hint" value={stackHint} onChange={(event) => setStackHint(event.target.value)} placeholder="例如 Java / Python / 数据库" aria-label="技术栈提示" disabled={reviewRunState === "reviewing"} />
+                    </div>
+                    <input ref={fileInputRef} className="hidden-file-input" type="file" multiple onChange={handleFileInputChange} />
+                    <button type="button" className="secondary-action" disabled={reviewRunState === "reviewing"} onClick={() => void handleSelectFiles()}>
+                      <FileInput size={16} />选取文件
+                    </button>
+                    <button type="button" className="primary-action" disabled={reviewRunState === "reviewing"} onClick={() => void handleStartReview()}>
+                      <WandSparkles size={16} />{reviewRunState === "reviewing" ? "审理中" : "开始审理"}
+                    </button>
+                  </div>
                 </div>
                 <div className="upload-types" aria-label="支持的上传类型">
                   <span>文本</span>
@@ -1672,7 +1816,7 @@ export default function Home() {
                   <span>文本型 PDF</span>
                   <span>网页链接</span>
                   <span>代码文件</span>
-                  <span data-state="pending">截图 OCR 待接入</span>
+                  <span data-state="pending" title="截图 OCR 待接入">截图 OCR 待接入</span>
                 </div>
               </motion.div>
             )}
@@ -1747,7 +1891,7 @@ export default function Home() {
                     <motion.article
                       key={note.title}
                       className="note-card"
-                      whileHover={{ y: -4, scale: 1.006 }}
+                      whileHover={prefersReducedMotion ? undefined : { y: -4, scale: 1.006 }}
                       transition={{ type: "spring", stiffness: 260, damping: 22 }}
                     >
                       <div className="note-index">{String(index + 1).padStart(2, "0")}</div>
@@ -1825,7 +1969,7 @@ export default function Home() {
                 <section className="preview-confirmation-context" aria-label="预览确认上下文">
                   <div className="context-section-title">
                     <strong>预览确认上下文</strong>
-                    <span>对照上传原文与 AI 审理结果后，再在右侧整批确认。</span>
+                    <span>对照上传原文与 AI 审理结果后，在下方确认写入。</span>
                   </div>
                   <article className="context-card">
                     <div className="context-title">
@@ -1913,73 +2057,8 @@ export default function Home() {
               />
             )}
           </AnimatePresence>
-        </div>
-
-        <aside className="side-panel workspace-panel" aria-label="检查与操作面板">
-          <div className="panel-head side-head">
-            <div>
-              <p className="panel-kicker">检查 / 操作面板</p>
-              <h2>{activeNav === "审理" ? batchPanelTitle : `${activeNav}操作`}</h2>
-            </div>
-            <Sparkles size={19} />
-          </div>
-
-          {activeNav === "入库" && (
-            <>
-              <SideSummary
-                items={[
-                  ["当前阶段", reviewRunState === "reviewing" ? "正在审理" : pendingInputCount > 0 ? "待开始审理" : "等待上传"],
-                  ["待审理输入", `${pendingInputCount} 条 / 文件 ${pendingFileItems.length} 个 / 粘贴文本 ${pendingTextCount} 条`],
-                  ["文件类型", pendingFileTypeSummary],
-                  ["技术栈提示", currentStackHintCopy],
-                  ["审理引擎", reviewEngineLabel],
-                  ["真实 Vault", vaultPath.trim() || "未配置"],
-                ]}
-              />
-              <section className="check-section pending-intake-panel">
-                <h3>
-                  <FileInput size={15} />
-                  上传检查
-                </h3>
-                {pendingInputCount > 0 ? (
-                  <div className="pending-inspection-list">
-                    {pendingTextCount > 0 && (
-                      <div className="pending-inspection-row">
-                        <span>文本</span>
-                        <div>
-                          <strong>{inferTitleFromText(pasteDraft.trim())}</strong>
-                          <p>点击开始审理后进入 Skill Runner。</p>
-                        </div>
-                      </div>
-                    )}
-                    {pendingFileItems.map((item) => (
-                      <div className="pending-inspection-row" key={`side-${item.id}`}>
-                        <span>{sourceTypeLabel(item.type)}</span>
-                        <div>
-                          <strong>{item.title}</strong>
-                          <p>
-                            {item.sizeLabel} / {item.origin === "desktop-path" ? "开始审理时由 Rust 读取路径" : "开始审理时读取文件内容"}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="empty-state">拖入或选择文件后，这里会显示文件名、类型和处理流程。</div>
-                )}
-              </section>
-              <section className="check-section">
-                <h3>
-                  <TriangleAlert size={15} />
-                  处理说明
-                </h3>
-                <div className="empty-state">上传阶段不解析 PDF，也不调用模型；开始审理后才执行提取、纠错、分类和关系生成。</div>
-              </section>
-            </>
-          )}
-
           {activeNav === "审理" && (
-            <>
+            <section className="review-details" aria-label="审理与写入">
               <section className="batch-state-card" data-state={batchStatus}>
                 <span>当前批次</span>
                 <strong>{batchPanelTitle}</strong>
@@ -2094,7 +2173,7 @@ export default function Home() {
                   <XCircle size={15} />
                   不确定内容
                 </h3>
-                <div className="empty-state">本批次暂无不确定项</div>
+                <div className="empty-state">请在预览中核对需要进一步确认的内容。</div>
               </section>
 
               <section className="check-section relations-section">
@@ -2177,36 +2256,12 @@ export default function Home() {
                   {transactionState === "writing" ? "写入中" : batchStatus === "confirmed" ? "已确认" : "整批确认"}
                 </motion.button>
               </div>
-            </>
+            </section>
           )}
-
-          {activeNav === "扫描" && (
-            <LogicLinkSidePanel
-              draft={logicLinkDraft}
-              runState={logicLinkRunState}
-              message={logicLinkMessage}
-              previewState={logicLinkPreviewState}
-              lastManifest={logicLinkLastManifest}
-              vaultPath={vaultPath}
-              onGenerate={() => void generateLogicLinkDraft()}
-              onOpenPreview={() => void openLogicLinkPreviewInObsidian()}
-              onConfirm={() => void confirmLogicLinkUpdates()}
-              onDiscard={() => void discardLogicLinkDraft()}
-            />
+          {activeNav === "扫描" && logicLinkLastManifest && (
+            <p className="transaction-receipt" role="status">最近写入：{logicLinkLastManifest.batchId} · {logicLinkLastManifest.files.length} 个父笔记</p>
           )}
-          {activeNav === "设置" && (
-            <SideSummary
-              items={[
-                ["Vault", vaultPath.trim() || "待填写真实路径"],
-                ["路径检查", vaultInspection?.message ?? "未检查"],
-                ["审理 Skill", "lifemind.review.v2 已接入"],
-                ["模型", reviewEngineLabel],
-                ["API 测试", apiTestMessage ? `${apiTestStatusLabel(apiTestState)}：${apiTestMessage}` : "未测试"],
-                ["Fallback", fallbackToLocal ? "开启，模型失败后使用本地审理" : "关闭，模型失败会直接报错"],
-              ]}
-            />
-          )}
-        </aside>
+        </div>
       </section>
     </main>
   );
@@ -2493,13 +2548,6 @@ function sourceTypeLabel(type: IntakeSourceType) {
   return labels[type];
 }
 
-function apiTestStatusLabel(state: ApiTestState) {
-  if (state === "testing") return "测试中";
-  if (state === "passed") return "成功";
-  if (state === "failed") return "失败";
-  return "未测试";
-}
-
 function stripExtension(name: string) {
   return name.replace(/\.[^.]+$/, "");
 }
@@ -2690,128 +2738,6 @@ function LogicLinkUpdateWorkspace({
         </div>
       </section>
     </motion.div>
-  );
-}
-
-function LogicLinkSidePanel({
-  draft,
-  runState,
-  message,
-  previewState,
-  lastManifest,
-  vaultPath,
-  onGenerate,
-  onOpenPreview,
-  onConfirm,
-  onDiscard,
-}: {
-  draft: LogicLinkUpdateDraft | null;
-  runState: LogicLinkRunState;
-  message: string;
-  previewState: PreviewState;
-  lastManifest: BatchManifest | null;
-  vaultPath: string;
-  onGenerate: () => void;
-  onOpenPreview: () => void;
-  onConfirm: () => void;
-  onDiscard: () => void;
-}) {
-  const isBusy = runState === "scanning" || runState === "reviewing" || runState === "confirming";
-  const suggestionCount = draft?.suggestions.length ?? 0;
-
-  return (
-    <>
-      <section className="batch-state-card" data-state={runState}>
-        <span>逻辑连接更新</span>
-        <strong>{logicLinkRunStateLabel(runState)}</strong>
-        <p>{message || "用户主动触发后，系统才会扫描时间范围并生成后续枝节写入草稿。"}</p>
-      </section>
-
-      <section className="check-section scan-process-panel">
-        <h3>
-          <ScanLine size={15} />
-          更新链路
-        </h3>
-        <div className="scan-process-list">
-          {["扫描真实 Vault", "按时间范围生成候选", "模型复审逻辑关系", "Obsidian 独立预览", "确认后事务写入并删除预览"].map(
-            (step, index) => (
-              <div className="scan-process-item" key={step}>
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <p>{step}</p>
-              </div>
-            ),
-          )}
-        </div>
-      </section>
-
-      <section className="check-section scan-side-detail">
-        <h3>
-          <Link2 size={15} />
-          本次草稿
-        </h3>
-        <div className="summary-row">
-          <span>真实 Vault</span>
-          <strong>{vaultPath.trim() || "未配置"}</strong>
-        </div>
-        <div className="summary-row">
-          <span>建议数量</span>
-          <strong>{suggestionCount} 条</strong>
-        </div>
-        <div className="summary-row">
-          <span>预览状态</span>
-          <strong>{logicLinkPreviewStateLabel(previewState)}</strong>
-        </div>
-        {draft && (
-          <div className="summary-row">
-            <span>草稿批次</span>
-            <strong>{draft.id}</strong>
-          </div>
-        )}
-        {lastManifest && (
-          <div className="summary-row">
-            <span>最近事务</span>
-            <strong>{`.lifemind/batches/${lastManifest.batchId}/manifest.json`}</strong>
-          </div>
-        )}
-      </section>
-
-      <div className="action-panel scan-action-panel">
-        <motion.button type="button" className="secondary-action" whileTap={{ scale: 0.98 }} disabled={isBusy} onClick={onGenerate}>
-          <ScanLine size={16} />
-          {isBusy ? "处理中" : "重新生成"}
-        </motion.button>
-        <motion.button
-          type="button"
-          className="secondary-action"
-          whileTap={{ scale: 0.98 }}
-          disabled={!draft || isBusy}
-          onClick={onOpenPreview}
-        >
-          <ExternalLink size={16} />
-          打开预览
-        </motion.button>
-        <motion.button
-          type="button"
-          className="secondary-action"
-          whileTap={{ scale: 0.98 }}
-          disabled={!draft || isBusy}
-          onClick={onDiscard}
-        >
-          <XCircle size={16} />
-          放弃草稿
-        </motion.button>
-        <motion.button
-          type="button"
-          className="primary-action"
-          whileTap={{ scale: 0.98 }}
-          disabled={!draft || suggestionCount === 0 || isBusy}
-          onClick={onConfirm}
-        >
-          <CheckCircle2 size={16} />
-          {runState === "confirming" ? "写入中" : "确认写入"}
-        </motion.button>
-      </div>
-    </>
   );
 }
 
@@ -3045,19 +2971,6 @@ function SettingsWorkspace({
         </span>
       </article>
     </motion.div>
-  );
-}
-
-function SideSummary({ items }: { items: Array<[string, string]> }) {
-  return (
-    <section className="check-section side-summary">
-      {items.map(([label, value]) => (
-        <div className="summary-row" key={label}>
-          <span>{label}</span>
-          <strong>{value}</strong>
-        </div>
-      ))}
-    </section>
   );
 }
 

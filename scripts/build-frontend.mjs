@@ -15,7 +15,11 @@ const assetsDir = path.join(tempOutDir, "assets");
 const backupOutDir = `${outDir}.previous`;
 
 for (const staleBuildDir of staleBuildDirs) {
-  rmSync(staleBuildDir, { recursive: true, force: true });
+  try {
+    rmSync(staleBuildDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  } catch (err) {
+    console.warn(`无法删除旧构建目录 ${staleBuildDir}，将继续构建：${err.message}`);
+  }
 }
 mkdirSync(assetsDir, { recursive: true });
 
@@ -31,6 +35,7 @@ try {
       "--loader:.tsx=tsx",
       "--loader:.ts=ts",
       "--loader:.css=css",
+      "--external:/fonts/*",
       "--minify=false",
     ],
     {
@@ -83,7 +88,11 @@ try {
     throw error;
   }
 } catch (error) {
-  rmSync(tempOutDir, { recursive: true, force: true });
+  try {
+    rmSync(tempOutDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  } catch (cleanupErr) {
+    console.warn(`无法清理临时目录 ${tempOutDir}：${cleanupErr.message}`);
+  }
   throw error;
 }
 

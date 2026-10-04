@@ -1,6 +1,7 @@
 export {
   AnimatePresence,
   motion,
+  useReducedMotion,
   useMotionValue,
   useSpring,
   useTransform,

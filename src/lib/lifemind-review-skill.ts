@@ -1989,7 +1989,8 @@ function validateSectionMediaReferences(
     return;
   }
 
-  const pageByNumber = new Map(source.pdfEvidence.pages.map((page) => [page.page, page]));
+  const pdfEvidence = source.pdfEvidence;
+  const pageByNumber = new Map(pdfEvidence.pages.map((page) => [page.page, page]));
   section.formulas.forEach((formula, index) => {
     const page = pageByNumber.get(formula.sourcePage);
     if (!page) {
@@ -2025,7 +2026,7 @@ function validateSectionMediaReferences(
       });
       return;
     }
-    const embeddedImage = source.pdfEvidence.images?.find((candidate) => candidate.assetId === image.assetId);
+    const embeddedImage = pdfEvidence.images?.find((candidate) => candidate.assetId === image.assetId);
     if (!embeddedImage || embeddedImage.page !== image.sourcePage) {
       errors.push({
         path: `$.sections[${section.id}].imagePlacements[${index}].assetId`,

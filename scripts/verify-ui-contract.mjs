@@ -11,6 +11,8 @@ const core = fs.readFileSync("src/lib/lifemind-core.ts", "utf8");
 const reviewSkill = fs.readFileSync("src/lib/lifemind-review-skill.ts", "utf8");
 const runner = fs.readFileSync("src/lib/lifemind-review-runner.ts", "utf8");
 const logicLink = fs.readFileSync("src/lib/lifemind-link-update.ts", "utf8");
+const loadingOverlayCss = css.match(/\.lifemind-loading-overlay\s*\{[^}]*\}/s)?.[0] ?? "";
+const sourceRowCss = css.match(/\.source-row p\s*\{[^}]*\}/s)?.[0] ?? "";
 
 function assert(condition, message) {
   if (!condition) {
@@ -49,7 +51,7 @@ assert(page.includes("previewRequestRef"), "preview open requests should be canc
 assert(page.includes("previewState === \"opening\""), "draft batch deletion should be disabled while preview is opening");
 assert(page.includes("LifeMind"), "visible product naming should use LifeMind casing");
 assert(page.includes("测试 API 连接"), "settings should show a test API connection button");
-assert(page.includes("API 测试"), "settings side panel should show API test feedback");
+assert(page.includes("apiTestMessage"), "settings workspace should show API test feedback");
 assert(page.includes("formatReviewUsage"), "review page should show request count and estimated API cost");
 assert(page.includes("失败后使用本地 fallback"), "settings should show a clear fallback toggle label");
 assert(page.includes("run_review_skill_model"), "external model review should call the Tauri backend command");
@@ -114,8 +116,8 @@ assert(page.includes('"save_model_api_key"'), "settings should save model API ke
 assert(page.includes('"load_model_api_key"'), "settings should load model API keys through the desktop keychain command");
 assert(!page.includes("lifemind.modelApiKey"), "model API keys must not be stored in localStorage");
 assert(page.includes("Vault 路径检查"), "settings should expose an explicit vault check result");
-assert(page.includes("待写入文件"), "review side panel should show the write plan");
-assert(page.includes("最近写入"), "review side panel should show rollback-capable batch history");
+assert(page.includes("待写入文件"), "review workspace should show the write plan");
+assert(page.includes("最近写入"), "review workspace should show rollback-capable batch history");
 assert(page.includes("writeFile?.path"), "preview cards should show final vault write paths");
 assert(!page.includes("const uploadedCases = ["), "review upload tab must not depend on hard-coded submitted test cases");
 assert(!page.includes("const generatedNotes = ["), "review results must not depend on hard-coded generated notes");
@@ -143,7 +145,7 @@ assert(
 );
 assert(page.includes('"confirm_logic_link_updates"'), "logic link confirmation should call the Tauri transaction command");
 assert(page.includes("buildLogicLinkPreviewFiles"), "logic link updates should generate an isolated Obsidian preview");
-assert(page.includes("确认后事务写入并删除预览"), "logic link process should tell users preview files are deleted after confirmation");
+assert(page.includes("确认写入后会删除本次临时预览文件"), "logic link process should tell users preview files are deleted after confirmation");
 assert(page.includes("discardLogicLinkDraft"), "logic link drafts should support deleting their preview files before confirmation");
 assert(page.includes("clearExistingLogicLinkDraftBeforeGenerate"), "regenerating logic links should clear stale draft state and preview files first");
 assert(page.includes("handleLogicLinkRangePresetChange"), "changing logic link range should clear stale suggestions from the previous range");
@@ -162,33 +164,16 @@ assert(page.includes("onClick={handleRemoveBatch}"), "batch delete should use th
 assert(!page.includes("hero-strip workspace-panel"), "desktop app should not render a landing-page style hero strip");
 assert(!page.includes("window.scrollTo"), "desktop navigation should not use page scrolling behavior");
 assert(css.includes("overflow: hidden;"), "desktop shell should suppress document-level scrolling");
-assert(css.includes("height: 100vh;"), "app shell should fit the desktop window viewport");
+assert(css.includes("height: 100vh;") || css.includes("height: 100dvh;"), "app shell should fit the desktop window viewport");
 assert(css.includes("position: fixed;"), "desktop shell should be fixed inside the WebView viewport");
-assert(css.includes("-webkit-backdrop-filter"), "loading overlay should support frosted blur in the macOS WebView");
-assert(css.includes("z-index: 999;"), "loading overlay should sit above the entire app chrome");
-assert(css.includes("overflow-y: auto;"), "side panels with long review content should scroll inside their frame");
+assert(css.includes(".lifemind-loading-overlay {"), "loading overlay should have a dedicated visual layer");
+assert(/z-index:\s*\d+/.test(loadingOverlayCss), "loading overlay should define an explicit stacking order");
+assert(css.includes("overflow-y: auto;") || css.includes("overflow: auto;"), "long review content should scroll inside the workspace");
 assert(css.includes("scrollbar-gutter: stable;"), "internal panel scrollbars should not shift the desktop layout");
-assert(css.includes(".source-list {"), "uploaded source context should have its own scroll container");
-assert(css.includes("-webkit-line-clamp: unset;"), "uploaded source context should not truncate the original text");
-assert(css.includes("max-height: min(62vh, 680px);"), "uploaded source cards should keep long text inside a scrollable frame");
-assert(css.includes(`grid-template-areas:\n      "brand status"\n      "dock dock";`), "medium windows should keep the header and dock in bounded rows");
-assert(css.includes("top: 174px;"), "medium windows should reserve space for the wrapped header");
-assert(
-  css.includes("  .panel-head {\n    align-items: flex-start;\n    flex-direction: column;\n  }"),
-  "medium windows should stack the workspace heading above its tabs",
-);
-assert(
-  css.includes("  .panel-actions {\n    width: 100%;\n    justify-content: space-between;\n  }"),
-  "medium windows should give workspace tabs and actions a full row",
-);
-assert(css.includes(`grid-template-areas:\n      "brand"\n      "dock"\n      "status";`), "small windows should stack the header without overlap");
-assert(css.includes("top: 220px;"), "small windows should reserve space for the stacked header");
-assert(css.includes("position: sticky;"), "review confirmation actions should remain visible inside the side panel");
-assert(
-  css.includes("grid-template-columns: minmax(0, 1fr) minmax(260px, 0.78fr);"),
-  "settings workspace should use a compact two-column layout so API feedback is visible",
-);
-assert(css.includes(".settings-list > .setting-row-input:last-child"), "model settings row should span the full settings grid");
+assert(/\.source-list(?:\s*,|\s*\{)/.test(css), "uploaded source context should have a dedicated list container");
+assert(sourceRowCss.includes("overflow: auto;"), "uploaded source context should keep the original text scrollable instead of truncating it");
+// Responsive layout and navigation are exercised by verify-lifemind-redesign.mjs.
+assert(css.includes("position: sticky;"), "review confirmation actions should stay accessible while scrolling");
 assert(tauri.app.windows[0].width >= 1360, "desktop window should be wide enough to show the app without feeling like a webpage");
 assert(tauri.app.windows[0].height >= 900, "desktop window should be tall enough to show the app without document scrolling");
 assert(tauri.app.windows[0].dragDropEnabled === true, "desktop file drops should be captured by Tauri so the app receives file paths");
