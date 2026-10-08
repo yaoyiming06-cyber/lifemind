@@ -436,3 +436,44 @@ pre { font-family: var(--font-code); }
   .lifemind-loading-logo { transform: none !important; }
   .island-nav::before, .island-nav::after, .island-burst, .island-burst::before, .island-burst::after { animation: none !important; }
 }
+
+/* The identity threads are drawn in viewport coordinates, then finish over the
+   live sidebar mark so the white canvas can dissolve without a visual jump. */
+.startup-animation {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  overflow: hidden;
+  isolation: isolate;
+}
+.startup-animation::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  transition: opacity 240ms ease-in-out;
+}
+.startup-animation[data-phase="revealing"] { pointer-events: none; }
+.startup-animation[data-phase="revealing"]::before { opacity: 0; }
+.app-shell[data-startup="playing"] { opacity: 0; }
+.app-shell[data-startup="revealing"] { opacity: 0; }
+.startup-animation-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  opacity: 0;
+  animation: startup-mark-intro 180ms var(--ease-out) forwards;
+  shape-rendering: geometricPrecision;
+}
+.startup-animation-canvas path { vector-effect: non-scaling-stroke; }
+@keyframes startup-mark-intro {
+  from { opacity: 0; filter: blur(5px); }
+  to { opacity: 1; filter: blur(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .startup-animation { display: none; }
+  .app-shell[data-startup] { opacity: 1; animation: none; }
+}

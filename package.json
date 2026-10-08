@@ -1,6 +1,6 @@
 {
   "name": "lifemind",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "scripts": {
     "dev": "vite --configLoader native --host 127.0.0.1 --port 3000",

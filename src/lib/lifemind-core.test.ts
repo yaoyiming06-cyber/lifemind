@@ -340,6 +340,54 @@ describe("lifemind review core", () => {
     expect(relationProperties.target).toBeUndefined();
   });
 
+  it.each([null, 1])("compiles text formulas without PDF metadata (sourcePage=%s)", (sourcePage) => {
+    const source: IntakeSource = {
+      id: "pasted-1", title: "数据处理", type: "text", stackHint: "Transformer",
+      content: "pos_weight = 已确认阴性样本数 / 已确认阳性样本数\nuncertain_ratio = 不确定样本数 /（阳性样本数 + 阴性样本数 + 不确定样本数）",
+    };
+    const plan = {
+      protocolVersion: REVIEW_ANALYSIS_PROTOCOL_VERSION,
+      pageCoverage: [],
+      stackDecisions: [{ sourceId: source.id, name: "Transformer", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: [{
+        id: "data-processing", sourceId: source.id, title: "样本统计", role: "应用步骤", grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: "数据处理", targetNodeId: null },
+        status: "新建笔记", existingNoteTitle: null,
+        body: "类别权重：{{formula:pos-weight}}\n不确定比例：{{formula:uncertain-ratio}}",
+        formulas: [
+          { id: "pos-weight", latex: "\\mathrm{pos\\_weight} = \\frac{N_{neg}}{N_{pos}}", display: "block", sourcePage, evidenceId: null, confidence: "高" },
+          { id: "uncertain-ratio", latex: "\\mathrm{uncertain\\_ratio} = \\frac{N_{uncertain}}{N_{pos}+N_{neg}+N_{uncertain}}", display: "inline", sourcePage, evidenceId: null, confidence: "高" },
+        ],
+        imagePlacements: [], evidence: ["原文两个样本统计公式"],
+      }],
+      relations: [], corrections: [], uncertain: [],
+    };
+    const parsed = parseReviewAnalysisPlan(JSON.stringify(plan), [source]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(JSON.stringify(parsed.errors));
+    expect(parsed.output.sections[0]?.formulas.map((formula) => formula.sourcePage)).toEqual([null, null]);
+    const batch = createReviewBatchFromAnalysisPlan([source], parsed.output);
+    expect(batch.notes[0]?.markdown).toContain("$$\n\\mathrm{pos\\_weight} = \\frac{N_{neg}}{N_{pos}}\n$$");
+    expect(batch.notes[0]?.markdown).toContain("$\\mathrm{uncertain\\_ratio} = \\frac{N_{uncertain}}{N_{pos}+N_{neg}+N_{uncertain}}$");
+    expect(batch.notes[0]?.markdown).not.toContain("{{formula:");
+
+    const withPdfEvidence = {
+      ...plan,
+      sections: [{ ...plan.sections[0], formulas: [{ ...plan.sections[0].formulas[0], evidenceId: "fabricated-pdf-page" }] }],
+    };
+    const evidenceParsed = parseReviewAnalysisPlan(JSON.stringify(withPdfEvidence), [source]);
+    expect(evidenceParsed.ok).toBe(true);
+    if (evidenceParsed.ok) expect(evidenceParsed.output.sections[0]?.formulas[0]?.evidenceId).toBeUndefined();
+
+    const withImage = {
+      ...plan,
+      sections: [{ ...plan.sections[0], imagePlacements: [{ assetId: "fake", sourcePage: 1, placement: "after-section", confidence: "高" }] }],
+    };
+    const imageParsed = parseReviewAnalysisPlan(JSON.stringify(withImage), [source]);
+    expect(imageParsed.ok).toBe(false);
+    if (!imageParsed.ok) expect(imageParsed.errors).toContainEqual(expect.objectContaining({ message: "图片放置只能引用 PDF 来源。" }));
+  });
+
   it("requires PDF page coverage and compiles verified formulas and page image placements", () => {
     const source: IntakeSource = {
       id: "src-dsp-pdf",
@@ -459,6 +507,14 @@ describe("lifemind review core", () => {
 
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) throw new Error("expected PDF analysis plan to pass");
+
+    const withoutPage = structuredClone(plan);
+    const missingPageParsed = parseReviewAnalysisPlan(JSON.stringify({
+      ...withoutPage,
+      sections: withoutPage.sections.map((section) => ({ ...section, formulas: section.formulas.map((formula) => ({ ...formula, sourcePage: null })) })),
+    }), [source]);
+    expect(missingPageParsed.ok).toBe(false);
+    if (!missingPageParsed.ok) expect(missingPageParsed.errors).toContainEqual(expect.objectContaining({ message: "公式来源页不在 PDF 页面证据中。" }));
 
     const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, {
       allowedPdfImageEvidence: [

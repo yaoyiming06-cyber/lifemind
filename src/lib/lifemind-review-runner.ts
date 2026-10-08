@@ -239,7 +239,10 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
               parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
               status: { type: "string", enum: ["新建笔记", "合并到旧笔记"] },
               existingNoteTitle: { anyOf: [{ type: "string" }, { type: "null" }] },
-              body: { type: "string" },
+              body: {
+                type: "string",
+                description: "知识段正文。每个 formulas 中的公式必须在此正文中恰好出现一次 {{formula:<id>}}；只填写公式的 anchor 字段不够。",
+              },
               formulas: {
                 type: "array",
                 items: {
@@ -249,10 +252,13 @@ export const deepSeekReviewTool: DeepSeekToolDefinition = {
                     id: { type: "string" },
                     latex: { type: "string" },
                     display: { type: "string", enum: ["inline", "block"] },
-                    sourcePage: { type: "integer", minimum: 1 },
+                    sourcePage: {
+                      anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }],
+                      description: "PDF 公式填写真实来源页码；粘贴文本、Markdown、网页、代码等非 PDF 来源填写 null。",
+                    },
                     evidenceId: {
                       anyOf: [{ type: "string" }, { type: "null" }],
-                      description: "填写对应 PDF 页面的文本 evidence id；若公式仅能从本轮已发送的页面图像确认，可填该页 assetId。",
+                      description: "非 PDF 公式填写 null。PDF 公式填写对应页的文本 evidence id；若仅能从本轮已发送的页面图像确认，可填该页 assetId。",
                     },
                     anchor: { anyOf: [{ type: "string" }, { type: "null" }] },
                     confidence: { type: "string", enum: ["高", "中", "低"] },

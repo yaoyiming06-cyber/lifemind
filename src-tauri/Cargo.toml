@@ -1,6 +1,6 @@
 [package]
 name = "lifemind"
-version = "0.2.4"
+version = "0.2.5"
 description = "Obsidian knowledge intake review desktop app"
 authors = ["lifemind"]
 license = ""

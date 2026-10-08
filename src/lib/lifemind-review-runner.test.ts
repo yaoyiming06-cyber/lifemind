@@ -284,6 +284,98 @@ describe("review usage accounting", () => {
     expect(sectionProperties.imagePlacements).toBeTruthy();
   });
 
+  it("allows formulas without a PDF page in the strict review schema", () => {
+    const parameters = deepSeekReviewTool.function.parameters as {
+      properties: {
+        sections: { items: { properties: {
+          formulas: { items: { properties: { sourcePage: Record<string, unknown> } } };
+        } } };
+      };
+    };
+
+    expect(parameters.properties.sections.items.properties.formulas.items.properties.sourcePage)
+      .toHaveProperty("anyOf", [{ type: "integer", minimum: 1 }, { type: "null" }]);
+  });
+
+  it("reviews pasted data-processing formulas twice without repair or fallback", async () => {
+    const input: IntakeSource = {
+      id: "pasted-data-processing",
+      title: "学习材料",
+      type: "text",
+      stackHint: "Transformer",
+      content: [
+        "一、数据处理：",
+        "1.确定10个分支各已确认阴/阳性样本数量，用于确认每个分支pos_weight",
+        "pos_weight = 已确认阴性样本数 / 已确认阳性样本数",
+        "2.确定每个分支的不确定样本数uncertain_ratio",
+        "uncertain_ratio = 不确定样本数 /（阳性样本数 + 阴性样本数 + 不确定样本数）",
+        "Atelectasis的不确定性比例很高，重点比较 U-Ones、U-Ignore、U-SelfTrained、U-MultiClass。",
+        "Pneumothorax的不确定比例很小，可以直接使用 U-Ignore 作为基线。",
+      ].join("\n"),
+    };
+    const plan = {
+      protocolVersion: "lifemind.review.v2",
+      pageCoverage: [],
+      stackDecisions: [{ sourceId: input.id, name: "Transformer", confidence: "高", evidence: ["用户技术栈提示"] }],
+      sections: [{
+        id: "data-processing",
+        sourceId: input.id,
+        title: "样本统计与不确定标签处理",
+        role: "应用步骤",
+        grain: "中颗粒度",
+        placement: { mode: "new-root", parentNodeId: null, branchName: "数据处理", targetNodeId: null },
+        parentId: null,
+        status: "新建笔记",
+        existingNoteTitle: null,
+        body: [
+          "各分支的正类权重：{{formula:pos-weight}}",
+          "各分支的不确定样本比例：{{formula:uncertain-ratio}}",
+          "Atelectasis 应比较 U-Ones、U-Ignore、U-SelfTrained、U-MultiClass；Pneumothorax 可使用 U-Ignore 作为基线。",
+        ].join("\n\n"),
+        formulas: [
+          {
+            id: "pos-weight", latex: "\\mathrm{pos\\_weight} = \\frac{N_{-}}{N_{+}}",
+            display: "block", sourcePage: null, evidenceId: null,
+            anchor: "{{formula:pos-weight}}", confidence: "高",
+          },
+          {
+            id: "uncertain-ratio", latex: "\\mathrm{uncertain\\_ratio} = \\frac{N_{u}}{N_{+} + N_{-} + N_{u}}",
+            display: "block", sourcePage: null, evidenceId: null,
+            anchor: "{{formula:uncertain-ratio}}", confidence: "高",
+          },
+        ],
+        imagePlacements: [],
+        evidence: ["原文明确给出的两个计算式及不确定标签处理策略"],
+      }],
+      relations: [],
+      corrections: [],
+      uncertain: [],
+    };
+    const requests: Array<OpenAICompatibleModelRequest> = [];
+    const result = await runReviewSkill([input], {
+      provider: "deepseek",
+      apiKey: "redacted-test-key",
+      fallbackToLocal: false,
+      qualityPasses: 2,
+      modelInvoker: async (payload) => {
+        requests.push(payload);
+        return JSON.stringify(plan);
+      },
+    });
+
+    expect(requests.map((payload) => payload.request.reviewMode)).toEqual(["draft-pass", "final-pass"]);
+    expect(requests.every((payload) => payload.request.protocolRepair === undefined)).toBe(true);
+    expect(result.usedFallback).toBe(false);
+    expect(result.provider).toBe("deepseek");
+    expect(result.batch.notes).toHaveLength(1);
+    const markdown = result.batch.notes[0].markdown;
+    expect(markdown).toContain(`$$\n${plan.sections[0].formulas[0].latex}\n$$`);
+    expect(markdown).toContain(`$$\n${plan.sections[0].formulas[1].latex}\n$$`);
+    expect(markdown).not.toContain("{{formula:");
+    expect(markdown).toContain("U-Ones");
+    expect(markdown).toContain("U-MultiClass");
+  });
+
   it("calculates DeepSeek V4 Pro cost from cache and completion usage", () => {
     const usage: ReviewModelUsage = {
       promptTokens: 100,

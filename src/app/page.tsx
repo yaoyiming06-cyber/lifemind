@@ -23,6 +23,7 @@ import XCircle from "lucide-react/dist/esm/icons/x-circle.mjs";
 import X from "lucide-react/dist/esm/icons/x.mjs";
 import { IslandNavigation } from "@/components/ui/island-navigation";
 import { LifemindMark } from "@/components/lifemind-mark";
+import { StartupAnimation } from "@/components/startup-animation";
 import { motion, AnimatePresence, useReducedMotion } from "@/lib/simple-motion";
 import {
   buildBatchPreviewRoot,
@@ -1587,7 +1588,9 @@ export default function Home() {
           : "vault";
 
   return (
-    <main ref={container} className="app-shell" data-sidebar-open={sidebarOpen}>
+    <>
+      <StartupAnimation />
+      <main ref={container} className="app-shell" data-sidebar-open={sidebarOpen}>
       <header className="app-chrome">
         <button
           ref={sidebarToggleRef}
@@ -2263,7 +2266,8 @@ export default function Home() {
           )}
         </div>
       </section>
-    </main>
+      </main>
+    </>
   );
 }
 

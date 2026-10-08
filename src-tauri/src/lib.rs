@@ -772,13 +772,17 @@ fn extract_webpage_text(url: String) -> Result<ExtractedContent, String> {
 }
 
 #[tauri::command]
-fn save_model_api_key(provider: String, api_key: String) -> Result<(), String> {
-    save_api_key(&provider, &api_key)
+async fn save_model_api_key(provider: String, api_key: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_api_key(&provider, &api_key))
+        .await
+        .map_err(|_| "系统钥匙串保存任务失败。".to_string())?
 }
 
 #[tauri::command]
-fn load_model_api_key(provider: String) -> Result<Option<String>, String> {
-    load_api_key(&provider)
+async fn load_model_api_key(provider: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_api_key(&provider))
+        .await
+        .map_err(|_| "系统钥匙串读取任务失败。".to_string())?
 }
 
 #[tauri::command]
@@ -4874,6 +4878,18 @@ mod tests {
             path.to_string_lossy(),
             "20-生成预览/Java/Java基础语法/Java 控制台输出.md"
         );
+    }
+
+    #[test]
+    fn runs_keychain_work_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let worker = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(|| std::thread::current().id())
+                .await
+                .unwrap()
+        });
+
+        assert_ne!(worker, caller);
     }
 
     #[test]

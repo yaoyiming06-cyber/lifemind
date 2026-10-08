@@ -68,7 +68,7 @@ export type ReviewAnalysisFormula = {
   id: string;
   latex: string;
   display: "inline" | "block";
-  sourcePage: number;
+  sourcePage: number | null;
   evidenceId?: string;
   anchor?: string;
   confidence: AnalysisConfidence;
@@ -311,6 +311,7 @@ export function buildReviewSkillSystemPrompt() {
     "PDF 页面图像是版面、手写内容和数学公式的主要证据；PDF 文本层只作为辅助对照，不能覆盖页面图像。",
     "PDF 文本层被本地标记为低质量时，应忽略其逐行文字证据，只根据附带的原始页面图像审理；无法从图像确认的公式和符号关系必须放入 uncertain。",
     "每个 sections 项必须返回 formulas 和 imagePlacements 数组；公式只能返回确认过的 LaTeX，正文用 {{formula:<id>}} 作为锚点。imagePlacements 只能引用 pdfPageManifest.embeddedImages 中且 embeddedImagesSent 包含的嵌入图片 assetId；页面渲染图仅供视觉审理，绝不能插入笔记。",
+    "所有来源都可以返回 formulas，包括粘贴文本、Markdown、网页和代码材料；非 PDF 公式的 sourcePage 和 evidenceId 必须为 null，imagePlacements 必须为空。PDF 公式的 sourcePage 必须为真实来源页码。每个公式必须在所属 sections[].body 中恰好出现一次 {{formula:<id>}}，不能只在 formulas[].anchor 中填写锚点。",
     "每个 PDF 页面必须在 pageCoverage 中恰好出现一次；即使页面没有可确认知识，也要返回 uncertain 或 unreadable，并说明原因。imagePagesOmitted 代表本轮没有发送图像的页面，不得声称已经视觉复核。",
     "若 sources[].pdfQuality.qualityStatus 为 warning，允许审理但必须保留风险提示；为 partial 时只对可确认片段生成 sections，困难片段放入 uncertain；为 blocked 时，只有页面图像明确支持的片段才能生成确定知识，其余必须放入 uncertain。pdfQuality.requiresManualReview 为 true 时，关键公式、标题、定义和关系必须人工复核后才能作为确定知识使用。",
     "若请求包含 vaultContext，它代表用户已确认写入 Obsidian 的既有知识结构；优先复用 vaultContext 中的技术栈、目录、导览页和相关笔记标题。",
@@ -470,6 +471,7 @@ export function createReviewAnalysisRequest(
       "只返回 JSON，不返回解释文字。",
       "必须调用 submit_review_plan 工具提交分析计划，不要只返回普通 message.content。",
       "这是结构分析协议，不要输出最终 notes[].markdown 或自由 path；输出 sections[].body 和 placement，由本地编译器生成最终 Markdown。",
+      "所有来源均可返回 formulas，且每个公式的 {{formula:<id>}} 必须在所属 sections[].body 中恰好出现一次；非 PDF 公式 sourcePage/evidenceId 为 null，imagePlacements 为空；PDF 公式必须填写真实来源页码。",
       "示例、注释和代码块只能作为证据，不得扩写成新的知识点。",
       "不要把示例、注释或代码块里的例子当成新的结论去单独命名笔记。",
       "用户填写的技术栈是根目录约束，不是可被模型替换的建议",
@@ -1501,7 +1503,9 @@ function readAnalysisFormulas(
     const id = readRequiredString(item, "id", `${itemPath}.id`, errors);
     const latex = readRequiredString(item, "latex", `${itemPath}.latex`, errors);
     const display = readEnum(item, "display", ["inline", "block"] as const, `${itemPath}.display`, errors);
-    const sourcePage = readRequiredInteger(item, "sourcePage", `${itemPath}.sourcePage`, errors);
+    const sourcePage = item.sourcePage === null
+      ? null
+      : readRequiredInteger(item, "sourcePage", `${itemPath}.sourcePage`, errors);
     const evidenceId = readOptionalString(item, "evidenceId");
     const anchor = readOptionalString(item, "anchor");
     const confidence = readEnum(item, "confidence", ["高", "中", "低"] as const, `${itemPath}.confidence`, errors);
@@ -1518,7 +1522,7 @@ function readAnalysisFormulas(
     if (id && body.split(marker).length - 1 > 1) {
       errors.push({ path: `${itemPath}.id`, message: `公式锚点 ${marker} 只能出现一次。` });
     }
-    if (id && latex && display && sourcePage > 0 && confidence) {
+    if (id && latex && display && (sourcePage === null || sourcePage > 0) && confidence) {
       formulas.push({
         id,
         latex,
@@ -1979,11 +1983,27 @@ function validateSectionMediaReferences(
   options: ReviewAnalysisValidationOptions,
 ) {
   const source = sources.find((candidate) => candidate.id === section.sourceId);
-  if (!source || source.type !== "pdf" || !source.pdfEvidence) {
+  if (!source) return;
+  if (source.type !== "pdf") {
+    section.formulas.forEach((formula, index) => {
+      // Older tool schemas required a page and sometimes copied a fabricated
+      // PDF evidence id into text formulas. Neither field is meaningful here.
+      formula.sourcePage = null;
+      formula.evidenceId = undefined;
+    });
+    if (section.imagePlacements.length > 0) {
+      errors.push({
+        path: `$.sections[${section.id}].imagePlacements`,
+        message: "图片放置只能引用 PDF 来源。",
+      });
+    }
+    return;
+  }
+  if (!source.pdfEvidence) {
     if (section.formulas.length > 0 || section.imagePlacements.length > 0) {
       errors.push({
-        path: `$.sections[${section.sourceId}]`,
-        message: "公式和图片放置只能引用 PDF 来源。",
+        path: `$.sections[${section.id}]`,
+        message: "PDF 公式和图片放置必须有对应的页面证据。",
       });
     }
     return;
@@ -1992,7 +2012,7 @@ function validateSectionMediaReferences(
   const pdfEvidence = source.pdfEvidence;
   const pageByNumber = new Map(pdfEvidence.pages.map((page) => [page.page, page]));
   section.formulas.forEach((formula, index) => {
-    const page = pageByNumber.get(formula.sourcePage);
+    const page = formula.sourcePage === null ? undefined : pageByNumber.get(formula.sourcePage);
     if (!page) {
       errors.push({
         path: `$.sections[${section.id}].formulas[${index}].sourcePage`,
