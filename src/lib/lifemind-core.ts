@@ -14,7 +14,6 @@ import {
   type ReviewAnalysisSection,
   type ReviewAnalysisFormula,
   type ReviewAnalysisImagePlacement,
-  type ReviewAnalysisPageCoverage,
   type ReviewAnalysisValidationOptions,
   type ReviewSkillOutput,
   type SourceOrganizationSignal,
@@ -25,6 +24,7 @@ import {
 } from "./lifemind-review-skill";
 import { formatKnowledgeMarkdown, normalizeFormulaExpression } from "./lifemind-presentation";
 import { effectiveSourceCharacterCount } from "./lifemind-source-structure";
+import { orderAnalysisSections } from "./lifemind-section-order";
 
 export {
   REVIEW_ANALYSIS_PROTOCOL_VERSION,
@@ -143,6 +143,8 @@ export type GeneratedNote = {
   path: string;
   status: "新建笔记" | "合并到旧笔记";
   markdown: string;
+  existingVaultPath?: string;
+  vaultFolderPath?: string;
 };
 
 export type KnowledgeRelation = {
@@ -542,10 +544,11 @@ export function createReviewBatchFromSkillOutput(
     normalizedSources,
     options.vaultContext ?? null,
   );
-  const uniqueTargetNotes = ensureUniqueGeneratedNoteTargets(promotionPlan.notes);
+  const uniqueTargetPlan = ensureUniqueGeneratedNoteTargets(promotionPlan.notes);
+  const uniqueTargetNotes = uniqueTargetPlan.notes;
   const relations = normalizeRelations(
     [...validation.output.relations, ...promotionPlan.relations],
-    uniqueTargetNotes,
+    uniqueTargetPlan.references,
   );
   const notes = uniqueTargetNotes.map((note) => normalizeGeneratedNote(note, relations));
 
@@ -594,10 +597,10 @@ export function createReviewBatchFromAnalysisPlan(
   const stackBySourceId = new Map(
     validation.output.stackDecisions.map((decision) => [decision.sourceId, decision.name]),
   );
-  const numberedSections = applyPdfSectionNumbers(
-    validation.output.sections,
-    normalizedSources,
-    validation.output.pageCoverage,
+  const numberedSections = applySectionNumbers(
+    orderAnalysisSections(validation.output.sections, normalizedSources, validation.output.pageCoverage),
+    stackBySourceId,
+    vaultIndex,
     options.vaultContext,
   );
   const draftNotes = numberedSections.map((section) =>
@@ -611,7 +614,7 @@ export function createReviewBatchFromAnalysisPlan(
   const organizationAlignedNotes = draftNotes.map((note) => {
     const section = numberedSections.find((candidate) => candidate.id === note.id);
 
-    if (section?.placement) return note;
+    if (section?.placement || note.existingVaultPath) return note;
 
     return alignNotesWithSourceOrganizationSignals(
       [note],
@@ -621,11 +624,11 @@ export function createReviewBatchFromAnalysisPlan(
   });
   const pathNormalizedNotes = organizationAlignedNotes.map((note) => {
     const section = numberedSections.find((candidate) => candidate.id === note.id);
-    return section?.placement ? note : normalizeGeneratedNotePath(note);
+    return section?.placement || note.existingVaultPath ? note : normalizeGeneratedNotePath(note);
   });
   const topicFolderPlan = applyAnalysisTopicFolderGrouping(
     pathNormalizedNotes,
-    numberedSections,
+    validation.output.sections,
     validation.output.relations,
     normalizedSources,
     vaultIndex,
@@ -639,14 +642,19 @@ export function createReviewBatchFromAnalysisPlan(
         normalizedSources,
         options.vaultContext ?? null,
       );
-  const numberedPdfNotes = applyNumberedPdfTopicFolders(
+  const numberedNotes = applyNumberedTopicFolders(
     promotionPlan.notes,
     numberedSections,
-    normalizedSources,
-    validation.output.pageCoverage,
+    options.vaultContext,
   );
-  const uniqueNotes = ensureUniqueGeneratedNoteTargets(numberedPdfNotes);
-  const moves = dedupeVaultMoveFiles([...topicFolderPlan.moves, ...promotionPlan.moves]);
+  const uniquePlan = ensureUniqueGeneratedNoteTargets(preserveKnownVaultDirectories(numberedNotes, vaultIndex));
+  const uniqueNotes = uniquePlan.notes;
+  const movePlan = alignMovesWithOrganizedNotes(
+    dedupeVaultMoveFiles([...topicFolderPlan.moves, ...promotionPlan.moves]),
+    promotionPlan.notes,
+    uniqueNotes,
+    options.vaultContext,
+  );
   const relationCandidates = [
     ...numberedSections.flatMap((section) =>
       section.parentId
@@ -655,15 +663,15 @@ export function createReviewBatchFromAnalysisPlan(
     ),
     ...validation.output.relations.map((relation) => ({
       type: relation.type,
-      source: resolveAnalysisReference(relation.source, numberedSections, uniqueNotes),
-      target: resolveAnalysisReference(relation.target, numberedSections, uniqueNotes),
+      source: resolveAnalysisReference(relation.source, validation.output.sections, uniquePlan.references),
+      target: resolveAnalysisReference(relation.target, validation.output.sections, uniquePlan.references),
       ...(relation.sourceNodeId ? { sourceNodeId: relation.sourceNodeId } : {}),
       ...(relation.targetNodeId ? { targetNodeId: relation.targetNodeId } : {}),
     })),
     ...promotionPlan.relations,
   ];
-  const unresolvedRelations = collectUnresolvedNodeRelations(relationCandidates, uniqueNotes, vaultIndex);
-  const relations = normalizeRelations(relationCandidates, uniqueNotes, vaultIndex);
+  const unresolvedRelations = collectUnresolvedNodeRelations(relationCandidates, uniquePlan.references, vaultIndex);
+  const relations = normalizeRelations(relationCandidates, uniquePlan.references, vaultIndex);
   const notes = uniqueNotes.map((note) => normalizeGeneratedNote(note, relations));
 
   return {
@@ -674,8 +682,8 @@ export function createReviewBatchFromAnalysisPlan(
     corrections: validation.output.corrections,
     notes,
     relations,
-    moves,
-    uncertain: [...validation.output.uncertain, ...unresolvedRelations, ...topicFolderPlan.uncertain],
+    moves: movePlan.moves,
+    uncertain: [...validation.output.uncertain, ...unresolvedRelations, ...topicFolderPlan.uncertain, ...movePlan.uncertain],
   };
 }
 
@@ -761,6 +769,21 @@ function compileAnalysisSection(
   vaultIndex: VaultKnowledgeNode[] = [],
   source?: IntakeSource,
 ): GeneratedNote {
+  const existing = section.status === "合并到旧笔记"
+    ? vaultIndex.find((node) => node.kind === "note" && (
+      node.id === section.placement?.targetNodeId ||
+      (!section.placement && normalizeComparableText(node.root) === normalizeComparableText(stack) &&
+        normalizeComparableText(node.title) === normalizeComparableText(section.existingNoteTitle ?? section.title))
+    ))
+    : undefined;
+  if (existing) {
+    return {
+      id: section.id, sourceId: section.sourceId, title: existing.title, grain: section.grain,
+      path: existing.path.split("/").slice(0, -1).join(" / "), status: section.status,
+      existingVaultPath: existing.path,
+      markdown: compileAnalysisSectionMarkdown(section, source),
+    };
+  }
   const modelRelativePath = section.placement
     ? resolvePlacementRelativePath(section.placement, stack, vaultIndex)
     : section.path ?? [];
@@ -817,156 +840,92 @@ function removePdfBodyImages(body: string) {
     .replace(/<img\b[^>]*>/giu, "");
 }
 
-function applyPdfSectionNumbers(
+function applySectionNumbers(
   sections: ReviewAnalysisSection[],
-  sources: IntakeSource[],
-  pageCoverage?: ReviewAnalysisPageCoverage[],
+  stackBySourceId: Map<string, string>,
+  vaultIndex: VaultKnowledgeNode[],
   vaultContext?: VaultKnowledgeContext | null,
 ) {
-  const pdfSourceIds = new Set(sources.filter((source) => source.type === "pdf").map((source) => source.id));
-  const chapterBySource = new Map<string, string>();
-  const countBySourceAndChapter = new Map<string, number>();
-  const sectionById = new Map(sections.map((section) => [section.id, section]));
-  const pageRankBySectionId = new Map<string, number>();
-
-  for (const coverage of pageCoverage ?? []) {
-    for (const sectionId of coverage.sectionIds) {
-      const current = pageRankBySectionId.get(sectionId);
-      if (current === undefined || coverage.page < current) pageRankBySectionId.set(sectionId, coverage.page);
-    }
+  const countsByRoot = new Map<string, Map<string, number>>();
+  const topicsByRoot = new Map<string, Array<{ chapter: string; title: string; path: string }>>();
+  for (const note of vaultContext?.notes ?? []) {
+    const match = /^(\d+)\.(\d+)\s+/u.exec(note.title.trim());
+    if (!match) continue;
+    const root = normalizeComparableText(note.root);
+    const counts = countsByRoot.get(root) ?? new Map<string, number>();
+    counts.set(match[1], Math.max(counts.get(match[1]) ?? 0, Number(match[2])));
+    countsByRoot.set(root, counts);
+    topicsByRoot.set(root, [...(topicsByRoot.get(root) ?? []), {
+      chapter: match[1], title: stripSectionNumber(note.title), path: note.path,
+    }]);
   }
-  const orderedIds = sections
-    .map((section, index) => ({ id: section.id, index, page: pageRankBySectionId.get(section.id) ?? Number.MAX_SAFE_INTEGER }))
-    .sort((left, right) => left.page - right.page || left.index - right.index)
-    .map((item) => item.id);
-  const numberedTitles = new Map<string, string>();
-  const existingNumberByChapter = collectExistingPdfNumbers(vaultContext, sources);
-  const existingTopicsBySource = collectExistingPdfTopics(vaultContext, sources);
+  const existingNextChapter = new Map([...countsByRoot].map(([root, counts]) =>
+    [root, String(Math.max(...[...counts.keys()].map(Number)) + 1)],
+  ));
+  const chapterBySource = new Map<string, string>();
+  const previousBySource = new Map<string, string>();
+  const numberedById = new Map<string, ReviewAnalysisSection>();
+  const sectionById = new Map(sections.map((section) => [section.id, section]));
 
-  for (const sectionId of orderedIds) {
-    const section = sectionById.get(sectionId);
-    if (!section) continue;
-    if (!pdfSourceIds.has(section.sourceId)) {
-      numberedTitles.set(section.id, section.title);
-      continue;
+  return sections.map((section) => {
+    const stack = stackBySourceId.get(section.sourceId) ?? "未归类";
+    const root = normalizeComparableText(stack);
+    if (section.status === "合并到旧笔记") {
+      numberedById.set(section.id, section);
+      return section;
     }
+    const path = section.placement
+      ? resolvePlacementRelativePath(section.placement, stack, vaultIndex)
+      : section.path ?? [];
+    const localPath = path.filter((segment) => normalizeComparableText(segment) !== root)
+      .map((segment) => segment.trim().toLowerCase()).join("/");
     const explicitChapter = extractChapterNumber(section.title);
     if (explicitChapter) {
       chapterBySource.set(section.sourceId, explicitChapter);
-      numberedTitles.set(section.id, section.title);
-      continue;
+      previousBySource.set(section.sourceId, localPath);
+      numberedById.set(section.id, section);
+      return section;
     }
-
-    const existingNumber = /^(\d+)(?:\.(\d+))?\s+/u.exec(section.title.trim());
-    if (existingNumber) {
-      const chapter = existingNumber[1];
-      chapterBySource.set(section.sourceId, chapter);
-      if (existingNumber[2]) {
-        const key = `${section.sourceId}:${chapter}`;
-        countBySourceAndChapter.set(key, Math.max(countBySourceAndChapter.get(key) ?? 0, Number(existingNumber[2])));
-      }
-      numberedTitles.set(section.id, section.title);
-      continue;
+    const parent = section.parentId ? numberedById.get(section.parentId) : undefined;
+    const parentChapter = parent ? extractChapterNumber(parent.title) ?? parent.title.match(/^(\d+)\./u)?.[1] : undefined;
+    const suppliedChapter = section.title.match(/^(\d+)(?:\.\d+)*\s+/u)?.[1];
+    const normalizedTitle = normalizeComparableText(stripSectionNumber(section.title));
+    const topics = topicsByRoot.get(root) ?? [];
+    const pathChapter = topics.filter((topic) => {
+      const folder = topic.path.split("/").slice(1, -1).map((segment) => segment.trim().toLowerCase()).join("/");
+      return folder && (localPath === folder || localPath.startsWith(`${folder}/`));
+    }).sort((left, right) => right.path.split("/").length - left.path.split("/").length)[0]?.chapter;
+    let topicSection = section;
+    const visited = new Set<string>();
+    while (topicSection.parentId && !visited.has(topicSection.parentId)) {
+      visited.add(topicSection.parentId);
+      const parentSection = sectionById.get(topicSection.parentId);
+      if (!parentSection || extractChapterNumber(parentSection.title)) break;
+      topicSection = parentSection;
     }
-
-    const parent = section.parentId ? sectionById.get(section.parentId) : undefined;
-    const parentChapter = parent ? extractChapterNumber(parent.title) : undefined;
-    const matchingExistingChapter = findMatchingExistingChapter(
-      section,
-      existingTopicsBySource.get(section.sourceId),
-    );
-    const previousSection = sections
-      .slice(0, sections.indexOf(section))
-      .reverse()
-      .find((candidate) => candidate.sourceId === section.sourceId && pdfSourceIds.has(candidate.sourceId));
-    const sameLocalPath = Boolean(
-      previousSection &&
-        (previousSection.path ?? []).join("/") === (section.path ?? []).join("/"),
-    );
-    const chapter =
-      parentChapter ??
-      matchingExistingChapter ??
-      (existingNumberByChapter.get(section.sourceId)?.size
-        ? sameLocalPath
-          ? chapterBySource.get(section.sourceId) ?? "1"
-          : inferNextPdfChapter(existingNumberByChapter.get(section.sourceId))
-        : chapterBySource.get(section.sourceId) ?? "1");
+    const topicTitle = normalizeComparableText(stripSectionNumber(topicSection.title));
+    const folderChapter = topics.find((topic) => {
+      const folder = topic.path.split("/")[1] ?? "";
+      const numberedFolderTitle = folder.match(/^\d+-(.+)$/u)?.[1];
+      return numberedFolderTitle && normalizeComparableText(numberedFolderTitle) === topicTitle;
+    })?.chapter;
+    const titleChapter = topics.find((topic) => {
+      const title = normalizeComparableText(topic.title);
+      return normalizedTitle && (title.includes(normalizedTitle) || normalizedTitle.includes(title));
+    })?.chapter;
+    const chapter = parentChapter ?? pathChapter ?? folderChapter ?? titleChapter ?? suppliedChapter ??
+      (previousBySource.get(section.sourceId) === localPath ? chapterBySource.get(section.sourceId) : undefined) ??
+      existingNextChapter.get(root) ?? chapterBySource.get(section.sourceId) ?? "1";
+    const counts = countsByRoot.get(root) ?? new Map<string, number>();
+    const next = (counts.get(chapter) ?? 0) + 1;
+    counts.set(chapter, next);
+    countsByRoot.set(root, counts);
     chapterBySource.set(section.sourceId, chapter);
-    const key = `${section.sourceId}:${chapter}`;
-    const next = Math.max(
-      (countBySourceAndChapter.get(key) ?? 0) + 1,
-      (existingNumberByChapter.get(section.sourceId)?.get(chapter) ?? 0) + 1,
-    );
-    countBySourceAndChapter.set(key, next);
-    numberedTitles.set(section.id, `${chapter}.${next} ${section.title}`);
-  }
-
-  return sections.map((section) => ({ ...section, ...(numberedTitles.has(section.id) ? { title: numberedTitles.get(section.id) } : {}) }));
-}
-
-function collectExistingPdfTopics(
-  vaultContext: VaultKnowledgeContext | null | undefined,
-  sources: IntakeSource[],
-) {
-  const result = new Map<string, Array<{ chapter: string; title: string; path: string }>>();
-  for (const source of sources) {
-    const root = normalizeComparableText(source.stackHint?.split(/[\\/]/)[0] ?? "");
-    const notes = (vaultContext?.notes ?? [])
-      .filter((note) => normalizeComparableText(note.root) === root)
-      .flatMap((note) => {
-        const chapter = note.title.match(/^(\d+)\./u)?.[1];
-        return chapter
-          ? [{
-              chapter,
-              title: note.title.replace(/^\d+\.\d+\s*/u, ""),
-              path: note.path,
-            }]
-          : [];
-      });
-    if (notes.length) result.set(source.id, notes);
-  }
-  return result;
-}
-
-function findMatchingExistingChapter(
-  section: ReviewAnalysisSection,
-  topics: Array<{ chapter: string; title: string; path: string }> | undefined,
-) {
-  const normalizedTitle = normalizeComparableText(section.title);
-  const sectionPath = (section.path ?? []).map(normalizeComparableText).filter(Boolean);
-  return topics?.find((topic) => {
-    const normalizedTopicTitle = normalizeComparableText(topic.title);
-    const titleMatch = normalizedTitle.includes(normalizedTopicTitle) || normalizedTopicTitle.includes(normalizedTitle);
-    const pathMatch = sectionPath.some((segment) => normalizeComparableText(topic.path).includes(segment));
-    return titleMatch || pathMatch;
-  })?.chapter;
-}
-
-function collectExistingPdfNumbers(
-  vaultContext: VaultKnowledgeContext | null | undefined,
-  sources: IntakeSource[],
-) {
-  const result = new Map<string, Map<string, number>>();
-  const roots = new Set(sources.filter((source) => source.type === "pdf").map((source) => normalizeComparableText(source.stackHint?.split(/[\\/]/)[0] ?? "")));
-  for (const note of vaultContext?.notes ?? []) {
-    if (!roots.has(normalizeComparableText(note.root))) continue;
-    const match = /^(\d+)\.(\d+)\s+/u.exec(note.title.trim());
-    if (!match) continue;
-    const chapters = result.get(note.root) ?? new Map<string, number>();
-    chapters.set(match[1], Math.max(chapters.get(match[1]) ?? 0, Number(match[2])));
-    result.set(note.root, chapters);
-  }
-  const bySource = new Map<string, Map<string, number>>();
-  for (const source of sources) {
-    const chapters = result.get(source.stackHint?.split(/[\\/]/)[0] ?? "");
-    if (chapters) bySource.set(source.id, chapters);
-  }
-  return bySource;
-}
-
-function inferNextPdfChapter(existing: Map<string, number> | undefined) {
-  if (!existing || existing.size === 0) return "1";
-  return String(Math.max(...existing.keys().map(Number)) + 1);
+    previousBySource.set(section.sourceId, localPath);
+    const numbered = { ...section, title: `${chapter}.${next} ${stripSectionNumber(section.title)}` };
+    numberedById.set(section.id, numbered);
+    return numbered;
+  });
 }
 
 function extractChapterNumber(title: string) {
@@ -1005,78 +964,112 @@ function renderAnalysisImagePlacement(placement: ReviewAnalysisImagePlacement, s
     : markdownImage;
 }
 
-function applyNumberedPdfTopicFolders(
+function applyNumberedTopicFolders(
   notes: GeneratedNote[],
   sections: ReviewAnalysisSection[],
-  sources: IntakeSource[],
-  pageCoverage?: ReviewAnalysisPageCoverage[],
+  vaultContext?: VaultKnowledgeContext | null,
 ) {
-  const pdfSourceIds = new Set(sources.filter((source) => source.type === "pdf").map((source) => source.id));
-  if (pdfSourceIds.size === 0 || notes.length === 0) return notes;
-
   const sectionById = new Map(sections.map((section) => [section.id, section]));
-  const noteById = new Map(notes.map((note) => [note.id, note]));
-  const parentById = new Map(sections.map((section) => [section.id, section.parentId]));
-  const firstPageBySection = new Map<string, number>();
-
-  for (const coverage of pageCoverage ?? []) {
-    if (coverage.status !== "covered") continue;
-    for (const sectionId of coverage.sectionIds) {
-      const current = firstPageBySection.get(sectionId);
-      if (current === undefined || coverage.page < current) firstPageBySection.set(sectionId, coverage.page);
-    }
-  }
-  const resultByNoteId = new Map<string, GeneratedNote>();
-  for (const sourceId of pdfSourceIds) {
-    const sourceSections = sections.filter((section) => section.sourceId === sourceId);
-    const topicIdBySection = new Map<string, string>();
-
-    for (const section of sourceSections) {
-      let topic = section;
-      const visited = new Set<string>();
-      while (topic.parentId && !visited.has(topic.parentId)) {
-        visited.add(topic.parentId);
-        const parent = sectionById.get(topic.parentId);
-        if (!parent || extractChapterNumber(parent.title)) break;
-        topic = parent;
-      }
-      topicIdBySection.set(section.id, topic.id);
-    }
-
-    const topicPages = new Map<string, number>();
-    for (const section of sourceSections) {
-      const topicId = topicIdBySection.get(section.id) ?? section.id;
-      const page = firstPageBySection.get(section.id) ?? Number.MAX_SAFE_INTEGER;
-      topicPages.set(topicId, Math.min(topicPages.get(topicId) ?? Number.MAX_SAFE_INTEGER, page));
-    }
-    const topicIds = [...topicPages.keys()].sort((left, right) =>
-      (topicPages.get(left) ?? Number.MAX_SAFE_INTEGER) - (topicPages.get(right) ?? Number.MAX_SAFE_INTEGER) ||
-      sourceSections.findIndex((section) => section.id === left) - sourceSections.findIndex((section) => section.id === right),
-    );
-
-    topicIds.forEach((topicId, index) => {
-      const topicTitle = stripPdfSectionNumber(sectionById.get(topicId)?.title ?? "未分类主题") || "未分类主题";
-      const folderName = `${String(index + 1).padStart(2, "0")}-${topicTitle}`;
-      for (const [sectionId, mappedTopicId] of topicIdBySection) {
-        if (mappedTopicId !== topicId) continue;
-        const note = noteById.get(sectionId);
-        if (!note) continue;
-
-        const segments = splitLogicalNotePath(note.path);
-        const root = segments.shift() ?? "未归类";
-        const relative = segments.filter((segment, relativeIndex) =>
-          !(relativeIndex === 0 && (normalizeComparableText(segment) === normalizeComparableText(topicTitle) || normalizeComparableText(segment) === normalizeComparableText(folderName))),
-        );
-        resultByNoteId.set(note.id, { ...note, path: [root, folderName, ...relative].join(" / ") });
-      }
-    });
+  const foldersByRoot = new Map<string, Map<string, string>>();
+  const maxByRoot = new Map<string, number>();
+  const existingPaths = [
+    ...(vaultContext?.roots.flatMap((root) => root.paths) ?? []),
+    ...(vaultContext?.notes.map((note) => note.path.split("/").slice(0, -1).join("/")) ?? []),
+  ];
+  for (const path of existingPaths) {
+    const [rootName, folder] = splitLogicalNotePath(path);
+    const match = folder?.match(/^(\d+)-(.+)$/u);
+    if (!match) continue;
+    const root = normalizeComparableText(rootName);
+    const folders = foldersByRoot.get(root) ?? new Map<string, string>();
+    folders.set(normalizeComparableText(match[2]), folder);
+    foldersByRoot.set(root, folders);
+    maxByRoot.set(root, Math.max(maxByRoot.get(root) ?? 0, Number(match[1])));
   }
 
-  return notes.map((note) => resultByNoteId.get(note.id) ?? note);
+  return notes.map((note) => {
+    if (note.status === "合并到旧笔记") return note;
+    let topic = sectionById.get(note.id);
+    const visited = new Set<string>();
+    while (topic?.parentId && !visited.has(topic.parentId)) {
+      visited.add(topic.parentId);
+      const parent = sectionById.get(topic.parentId);
+      if (!parent || extractChapterNumber(parent.title)) break;
+      topic = parent;
+    }
+    const topicTitle = stripSectionNumber(topic?.title ?? note.title) || "未分类主题";
+    const [rootName = "未归类", ...relative] = splitLogicalNotePath(note.path);
+    const root = normalizeComparableText(rootName);
+    const folders = foldersByRoot.get(root) ?? new Map<string, string>();
+    // A selected numbered directory is already an organized destination.
+    if (/^\d+-/u.test(relative[0] ?? "")) {
+      return note;
+    }
+    let folder = folders.get(normalizeComparableText(topicTitle));
+    if (!folder) {
+      const next = (maxByRoot.get(root) ?? 0) + 1;
+      folder = `${String(next).padStart(2, "0")}-${topicTitle}`;
+      maxByRoot.set(root, next);
+      folders.set(normalizeComparableText(topicTitle), folder);
+      foldersByRoot.set(root, folders);
+    }
+    const remaining = relative.filter((segment) =>
+      normalizeComparableText(stripSectionNumber(segment)) !== normalizeComparableText(topicTitle));
+    return { ...note, path: [rootName, folder, ...remaining].join(" / ") };
+  });
 }
 
-function stripPdfSectionNumber(title: string) {
-  return title.replace(/^\d+(?:\.\d+)*\s*/u, "").trim();
+function stripSectionNumber(title: string) {
+  return title.replace(/^\d+(?:\.\d+)*\s+/u, "").trim();
+}
+
+function preserveKnownVaultDirectories(notes: GeneratedNote[], vaultIndex: VaultKnowledgeNode[]) {
+  const directories = vaultIndex.filter((node) => node.kind === "root" || node.kind === "directory")
+    .map((node) => ({ path: node.path, segments: splitLogicalNotePath(node.path) }))
+    .sort((left, right) => right.segments.length - left.segments.length);
+  return notes.map((note) => {
+    const segments = splitLogicalNotePath(note.path);
+    const existing = directories.find((directory) => directory.segments.every((segment, index) =>
+      segment.toLowerCase() === (segments[index] ?? "").toLowerCase())) ??
+      directories.find((directory) => directory.segments.every((segment, index) =>
+        normalizeComparableText(segment) === normalizeComparableText(segments[index] ?? "")));
+    if (!existing) return note;
+    const newSegments = segments.slice(existing.segments.length).map((segment) => safePathSegment(segment.replace(/\s+/gu, "")));
+    return { ...note, vaultFolderPath: [existing.path, ...newSegments].join("/") };
+  });
+}
+
+function alignMovesWithOrganizedNotes(
+  moves: VaultMoveFile[],
+  before: GeneratedNote[],
+  after: GeneratedNote[],
+  vaultContext?: VaultKnowledgeContext | null,
+) {
+  const mappings = before.flatMap((note) => {
+    const organized = after.find((candidate) => candidate.id === note.id);
+    if (!organized || note.status === "合并到旧笔记" || note.path === organized.path) return [];
+    return [{ from: notePathToVaultFolderPath(note.path), to: noteVaultPath(organized).split("/").slice(0, -1).join("/") }];
+  }).sort((left, right) => right.from.length - left.from.length);
+  const occupied = new Set([
+    ...(vaultContext?.notes.map((note) => normalizeVaultRelativePath(note.path)) ?? []),
+    ...after.map(noteVaultPath),
+  ]);
+  const mergeTargets = new Set(after.filter((note) => note.existingVaultPath).map((note) => normalizeVaultRelativePath(note.existingVaultPath!)));
+  const uncertain: string[] = [];
+  const aligned: VaultMoveFile[] = [];
+  for (const move of moves) {
+    if (mergeTargets.has(normalizeVaultRelativePath(move.fromPath))) continue;
+    const mapping = mappings.find((item) => move.toPath.startsWith(`${item.from}/`));
+    const toPath = mapping ? `${mapping.to}${move.toPath.slice(mapping.from.length)}` : move.toPath;
+    if (toPath === move.fromPath) continue;
+    if (occupied.has(toPath)) {
+      uncertain.push(`旧笔记“${move.title}”迁移目标已存在：${toPath}，已跳过自动迁移。`);
+      continue;
+    }
+    occupied.add(toPath);
+    aligned.push({ ...move, toPath });
+  }
+  return { moves: aligned, uncertain };
 }
 
 function resolvePlacementRelativePath(
@@ -1167,8 +1160,7 @@ export function buildBatchPreviewRoot(parentRoot: string, batchId: string) {
 }
 
 export function notePreviewPath(note: GeneratedNote) {
-  const pathSegments = note.path.split("/").map((segment) => segment.trim().replace(/\s+/g, ""));
-  return `20-生成预览/${pathSegments.map(safePathSegment).join("/")}/${safeFileName(note.title)}.md`;
+  return `20-生成预览/${noteVaultPath(note)}`;
 }
 
 export function buildVaultWriteFiles(batch: ReviewBatch): VaultWriteFile[] {
@@ -1226,8 +1218,9 @@ export function buildVaultMoveFiles(batch: ReviewBatch): VaultMoveFile[] {
 }
 
 export function noteVaultPath(note: GeneratedNote) {
+  if (note.existingVaultPath) return note.existingVaultPath;
   const pathSegments = note.path.split("/").map((segment) => segment.trim().replace(/\s+/g, ""));
-  return `${pathSegments.map(safePathSegment).join("/")}/${safeFileName(note.title)}.md`;
+  return `${note.vaultFolderPath ?? pathSegments.map(safePathSegment).join("/")}/${safeFileName(note.title)}.md`;
 }
 
 type GuideMode = "preview" | "vault";
@@ -1468,17 +1461,18 @@ function applyAnalysisTopicFolderGrouping(
   for (const parentSection of sections) {
     const parentNote = noteById.get(parentSection.id);
 
-    if (!parentNote || !isPromotableExistingTopicTitle(parentNote.title)) continue;
+    if (!parentNote || parentNote.status === "合并到旧笔记" || !isPromotableExistingTopicTitle(stripSectionNumber(parentNote.title))) continue;
     if (!canCreateAnalysisTopicFolder(parentSection, sourceById)) continue;
 
-    const topicFolderPath = appendTopicFolderPath(parentNote.path, parentNote.title);
+    const topicFolderPath = appendTopicFolderPath(parentNote.path, stripSectionNumber(parentNote.title));
     const childNotes = (childrenByParentId.get(parentSection.id) ?? [])
       .map((childSection) => noteById.get(childSection.id))
       .filter((childNote): childNote is GeneratedNote => Boolean(childNote))
+      .filter((childNote) => childNote.status !== "合并到旧笔记")
       .filter((childNote) => isTopicFolderChild(parentNote, childNote, topicFolderPath));
     const existingMembers = collectExistingTopicFolderMembers(
       parentSection,
-      parentNote,
+      { ...parentNote, title: stripSectionNumber(parentNote.title) },
       topicFolderPath,
       relations,
       vaultNodeById,
@@ -1719,12 +1713,32 @@ function collectUnresolvedNodeRelations(
 
 function ensureUniqueGeneratedNoteTargets(notes: GeneratedNote[]) {
   const usedPaths = new Set<string>();
+  // Existing destinations are immutable; reserve them before naming new files.
+  const reservedPaths = new Set(notes.filter((note) => note.existingVaultPath).map((note) => noteVaultPath(note).toLowerCase()));
+  const mergesByPath = new Map<string, GeneratedNote>();
+  const uniqueNotes: GeneratedNote[] = [];
+  const references: GeneratedNote[] = [];
 
-  return notes.map((note) => {
+  for (const note of notes) {
+    if (note.existingVaultPath) {
+      const path = normalizeVaultRelativePath(note.existingVaultPath);
+      const previous = mergesByPath.get(path);
+      if (previous) {
+        previous.markdown = `${previous.markdown}\n\n${note.markdown}`;
+        references.push({ ...note, title: previous.title });
+        continue;
+      }
+      const merged = { ...note };
+      mergesByPath.set(path, merged);
+      usedPaths.add(noteVaultPath(merged).toLowerCase());
+      uniqueNotes.push(merged);
+      references.push(merged);
+      continue;
+    }
     let nextNote = note;
     let suffix = 2;
 
-    while (usedPaths.has(normalizeComparableText(noteVaultPath(nextNote)))) {
+    while (usedPaths.has(noteVaultPath(nextNote).toLowerCase()) || reservedPaths.has(noteVaultPath(nextNote).toLowerCase())) {
       nextNote = {
         ...note,
         title: `${note.title} ${suffix}`,
@@ -1732,9 +1746,11 @@ function ensureUniqueGeneratedNoteTargets(notes: GeneratedNote[]) {
       suffix += 1;
     }
 
-    usedPaths.add(normalizeComparableText(noteVaultPath(nextNote)));
-    return nextNote;
-  });
+    usedPaths.add(noteVaultPath(nextNote).toLowerCase());
+    uniqueNotes.push(nextNote);
+    references.push(nextNote);
+  }
+  return { notes: uniqueNotes, references };
 }
 
 function dedupeVaultMoveFiles(moves: VaultMoveFile[]) {
@@ -1821,6 +1837,7 @@ function applyExistingTopicPromotions(
   const selectionByNoteId = new Map<string, ExistingTopicPromotionSelection>();
 
   for (const note of notes) {
+    if (note.status === "合并到旧笔记") continue;
     const sourceText = sourceTextById.get(note.sourceId) ?? "";
     const selection = selectExistingTopicPromotion(note, sourceText, candidates);
 
@@ -1840,6 +1857,7 @@ function applyExistingTopicPromotions(
   }
 
   const notesWithPromotedPaths = notes.map((note) => {
+    if (note.status === "合并到旧笔记") return note;
     const selection = selectionByNoteId.get(note.id);
 
     if (selection) {
@@ -1860,7 +1878,7 @@ function applyExistingTopicPromotions(
 
     return {
       ...note,
-      title: uniqueSupplementTitle(duplicateGuideCandidate.title, notes),
+      title: `${note.title.match(/^\d+(?:\.\d+)*\s+/u)?.[0] ?? ""}${uniqueSupplementTitle(duplicateGuideCandidate.title, notes)}`,
       path: duplicateGuideCandidate.targetFolderPath,
     };
   });
@@ -1969,7 +1987,7 @@ function scoreExistingTopicPromotion(
   sourceText: string,
   candidate: ExistingTopicPromotionCandidate,
 ) {
-  const noteTitle = normalizeComparableText(note.title);
+  const noteTitle = normalizeComparableText(stripSectionNumber(note.title));
   const pathSegments = note.path
     .split("/")
     .map((segment) => normalizeComparableText(segment))
@@ -1996,7 +2014,7 @@ function selectGeneratedSameTitleGuidePromotion(
   sourceText: string,
   candidates: ExistingTopicPromotionCandidate[],
 ) {
-  const noteTitle = normalizeComparableText(note.title);
+  const noteTitle = normalizeComparableText(stripSectionNumber(note.title));
   const pathSegments = note.path
     .split("/")
     .map((segment) => normalizeComparableText(segment))

@@ -893,10 +893,6 @@ export default function Home() {
     enqueuePendingFiles(selectedPaths.map((path, index) => createPendingPathFileItem(path, index)));
   }
 
-  sourcePathHandlerRef.current = (paths: string[]) => {
-    handleSourcePaths(paths);
-  };
-
   async function handleWebUrlReview() {
     const url = webUrlDraft.trim();
 
@@ -978,6 +974,12 @@ export default function Home() {
       return [...current, ...uniqueItems];
     });
   }
+
+  useEffect(() => {
+    sourcePathHandlerRef.current = (paths: string[]) => {
+      handleSourcePaths(paths);
+    };
+  });
 
   function removePendingFile(id: string) {
     setPendingFileItems((current) => current.filter((item) => item.id !== id));

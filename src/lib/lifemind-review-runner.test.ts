@@ -490,7 +490,7 @@ describe("review usage accounting", () => {
       "repair-pass",
       "final-pass",
     ]);
-    expect(result.batch.notes[0].title).toBe("Git 工具总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 工具总览");
   });
 
   it("accepts usage returned by the desktop model bridge", async () => {

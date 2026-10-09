@@ -321,6 +321,8 @@ export function buildReviewSkillSystemPrompt() {
     "新协议中不要输出 sections[].path；请使用 sections[].placement 选择 vaultIndex 中的节点 ID。旧协议 path 只用于兼容历史请求。",
     "placement.parentNodeId、placement.targetNodeId、relations[].sourceNodeId 和 relations[].targetNodeId 只能填写 vaultIndex 中真实存在的 ID，不能自行拼接路径或猜测标题。",
     "本地系统会根据节点 ID 生成最终 Obsidian 路径和双链；你只判断语义位置，不直接生成文件系统路径。",
+    "所有来源共享本地组织规则，包括短文本、Markdown、网页、代码与 PDF：新笔记归入带序号的二级主题目录，并使用 1.1、1.2 等编号，接续同技术栈已有编号；合并旧笔记保留旧标题和原路径。",
+    "本地按 PDF 首次覆盖页码、其他来源的原文标题或 evidence 片段位置排序，父主题先于其分支；请提供能在原文定位的 evidence，未能定位时保留输出顺序。新笔记标题不必自行添加编号，原文明确的章节标题应保留。",
     "所有放置决策必须经过统一语义归类判断：先理解技术栈、知识角色和主题范围，再从 vaultIndex 选择节点或决定在正确父节点下新建分支。",
     "每个 sources[].id 必须对应一个 stackDecisions 项。stackDecisions[].name 是该来源的技术栈根目录。",
     "用户填写的 stackHint 是根目录约束，不是可被模型替换的建议；只要该来源填写了 stackHint，stackDecisions[].name 必须等于其第一段技术栈名称，不能改成 AI 或其他相似分类。",
@@ -982,7 +984,7 @@ function stripMarkdownFileExtension(value: string) {
 }
 
 function stableVaultNodeId(kind: "root" | "directory" | "note", value: string) {
-  const normalized = normalizeComparableReference(value) || "node";
+  const normalized = normalizeTaxonomyPath(value).toLowerCase() || "node";
   let hash = 2166136261;
 
   for (const character of normalized) {

@@ -103,13 +103,13 @@ describe("lifemind review core", () => {
       "where count(*) > 3",
     ]);
     expect(batch.notes.map((note) => [note.title, note.grain, note.path])).toEqual([
-      ["Java 控制台输出", "中颗粒度", "Java / Java 基础语法 / 输入与输出"],
-      ["Python 列表 append", "小颗粒度", "Python / Python 基础语法 / 列表"],
-      ["SQL WHERE 与 HAVING", "小颗粒度", "数据库 / SQL 查询 / 聚合查询"],
+      ["1.1 Java 控制台输出", "中颗粒度", "Java / 01-Java 控制台输出 / Java 基础语法 / 输入与输出"],
+      ["1.1 Python 列表 append", "小颗粒度", "Python / 01-Python 列表 append / Python 基础语法 / 列表"],
+      ["1.1 SQL WHERE 与 HAVING", "小颗粒度", "数据库 / 01-SQL WHERE 与 HAVING / SQL 查询 / 聚合查询"],
     ]);
     expect(batch.relations).toContainEqual({
       type: "前置知识",
-      source: "Java 控制台输出",
+      source: "1.1 Java 控制台输出",
       target: "Java 基础语法",
     });
   });
@@ -122,11 +122,11 @@ describe("lifemind review core", () => {
 
     expect(files.map((file) => file.path)).toContain("00-审理确认总览.md");
     expect(files.map((file) => file.path)).toContain("00-原始上传/src-java-Java 控制台输出原文.md");
-    expect(files.map((file) => file.path)).toContain("10-审理结果/Java 控制台输出.md");
+    expect(files.map((file) => file.path)).toContain("10-审理结果/1.1 Java 控制台输出.md");
     expect(files.map((file) => file.path)).toContain("20-生成预览/Java/00-导览/00-Java 导览.md");
-    expect(files.map((file) => file.path)).toContain("20-生成预览/Java/Java基础语法/输入与输出/Java 控制台输出.md");
+    expect(files.map((file) => file.path)).toContain("20-生成预览/Java/01-Java控制台输出/Java基础语法/输入与输出/1.1 Java 控制台输出.md");
     expect(files.find((file) => file.path === "00-审理确认总览.md")?.content).toContain(
-      "[[20-生成预览/Java/Java基础语法/输入与输出/Java 控制台输出|Java 控制台输出]]",
+      "[[20-生成预览/Java/01-Java控制台输出/Java基础语法/输入与输出/1.1 Java 控制台输出|1.1 Java 控制台输出]]",
     );
   });
 
@@ -137,9 +137,9 @@ describe("lifemind review core", () => {
     const files = buildVaultWriteFiles(batch);
 
     expect(files.map((file) => file.path)).toEqual([
-      "Java/Java基础语法/输入与输出/Java 控制台输出.md",
-      "Python/Python基础语法/列表/Python 列表 append.md",
-      "数据库/SQL查询/聚合查询/SQL WHERE 与 HAVING.md",
+      "Java/01-Java控制台输出/Java基础语法/输入与输出/1.1 Java 控制台输出.md",
+      "Python/01-Python列表append/Python基础语法/列表/1.1 Python 列表 append.md",
+      "数据库/01-SQLWHERE与HAVING/SQL查询/聚合查询/1.1 SQL WHERE 与 HAVING.md",
     ]);
     expect(files.some((file) => /\/00-.*导览\.md$/.test(file.path))).toBe(false);
     expect(files[0].content).not.toContain("# Java 控制台输出");
@@ -172,12 +172,12 @@ describe("lifemind review core", () => {
     expect(batch.corrections).toEqual([]);
     expect(batch.notes).toHaveLength(1);
     expect(batch.notes[0]).toMatchObject({
-      title: "C++ vector 记录",
+      title: "1.1 C++ vector 记录",
       grain: "中颗粒度",
-      path: "C++ / 待细分",
+      path: "C++ / 01-C++ vector 记录 / 待细分",
       status: "新建笔记",
     });
-    expect(noteVaultPath(batch.notes[0])).toBe("C++/待细分/C++ vector 记录.md");
+    expect(noteVaultPath(batch.notes[0])).toBe("C++/01-C++vector记录/待细分/1.1 C++ vector 记录.md");
     expect(batch.notes[0].markdown).toContain("vector 可以动态存储同类型元素");
   });
 
@@ -1338,7 +1338,7 @@ describe("lifemind review core", () => {
 
     expect(requests).toHaveLength(2);
     expect(result.usedFallback).toBe(false);
-    expect(result.batch.notes[0].path).toBe("操作系统 / 总览");
+    expect(result.batch.notes[0].path).toBe("操作系统 / 01-操作系统总览 / 总览");
     expect(result.message).toContain("自动重试");
   });
 
@@ -1385,8 +1385,8 @@ describe("lifemind review core", () => {
       now: new Date(2026, 6, 10, 9, 30, 0),
     });
 
-    expect(batch.notes[0].path).toBe("TI嵌入式 / 术语");
-    expect(noteVaultPath(batch.notes[0])).toBe("TI嵌入式/术语/Port Segment.md");
+    expect(batch.notes[0].path).toBe("TI嵌入式 / 01-Port Segment / 术语");
+    expect(noteVaultPath(batch.notes[0])).toBe("TI嵌入式/01-PortSegment/术语/1.1 Port Segment.md");
     expect(batch.notes[0].path).not.toContain("GPIO");
     expect(batch.notes[0].markdown).toContain("归类：[[TI嵌入式]]");
   });
@@ -1460,8 +1460,8 @@ describe("lifemind review core", () => {
 
     const batch = createReviewBatchFromAnalysisPlan([source], parsed.output, { vaultContext });
 
-    expect(batch.notes[0].path).toBe("TI嵌入式 / 术语");
-    expect(noteVaultPath(batch.notes[0])).toBe("TI嵌入式/术语/Port Segment.md");
+    expect(batch.notes[0].path).toBe("TI嵌入式 / 01-Port Segment / 术语");
+    expect(noteVaultPath(batch.notes[0])).toBe("TI嵌入式/01-PortSegment/术语/1.1 Port Segment.md");
     expect(batch.notes[0].path).not.toContain("MSPM0G3507");
     expect(batch.notes[0].path).not.toContain("GPIO");
   });
@@ -1536,13 +1536,13 @@ describe("lifemind review core", () => {
     const batch = createReviewBatchFromAnalysisPlan([source], parsed.output);
 
     expect(batch.notes.map((note) => note.path)).toEqual([
-      "操作系统 / 操作系统基础",
-      "操作系统 / 进程管理",
+      "操作系统 / 01-操作系统总览 / 操作系统基础",
+      "操作系统 / 01-操作系统总览 / 进程管理",
     ]);
     expect(batch.relations).toContainEqual({
       type: "包含",
-      source: "操作系统总览",
-      target: "进程管理",
+      source: "1.1 操作系统总览",
+      target: "1.2 进程管理",
     });
   });
 
@@ -1627,7 +1627,7 @@ describe("lifemind review core", () => {
 
     expect(batch.relations).toContainEqual({
       type: "前置知识",
-      source: "UART 串口",
+      source: "1.1 UART 串口",
       target: "GPIO 接口",
     });
   });
@@ -1765,15 +1765,15 @@ describe("lifemind review core", () => {
     const batch = createReviewBatchFromAnalysisPlan(sources, parsed.output);
 
     expect(batch.notes.map((note) => note.title)).toEqual([
-      "Git 工具总览",
-      "Git 工具基本概念",
-      "Git 工具应用步骤",
-      "Git 常用命令与代码",
+      "1.1 Git 工具总览",
+      "1.2 Git 工具基本概念",
+      "1.3 Git 工具应用步骤",
+      "1.4 Git 常用命令与代码",
     ]);
-    expect(batch.relations).toContainEqual({ type: "包含", source: "Git 工具总览", target: "Git 工具基本概念" });
-    expect(batch.relations).toContainEqual({ type: "包含", source: "Git 工具总览", target: "Git 工具应用步骤" });
-    expect(batch.relations).toContainEqual({ type: "包含", source: "Git 工具总览", target: "Git 常用命令与代码" });
-    expect(batch.relations).toContainEqual({ type: "前置知识", source: "Git 工具应用步骤", target: "Git 工具基本概念" });
+    expect(batch.relations).toContainEqual({ type: "包含", source: "1.1 Git 工具总览", target: "1.2 Git 工具基本概念" });
+    expect(batch.relations).toContainEqual({ type: "包含", source: "1.1 Git 工具总览", target: "1.3 Git 工具应用步骤" });
+    expect(batch.relations).toContainEqual({ type: "包含", source: "1.1 Git 工具总览", target: "1.4 Git 常用命令与代码" });
+    expect(batch.relations).toContainEqual({ type: "前置知识", source: "1.3 Git 工具应用步骤", target: "1.2 Git 工具基本概念" });
   });
 
   it("places child sections inside separate integration folders under the same vault directory", () => {
@@ -1890,18 +1890,18 @@ describe("lifemind review core", () => {
     }, { vaultContext });
 
     expect(batch.notes.map((note) => [note.title, note.path])).toEqual([
-      ["数据投放到网页上方法", "React / 基础"],
-      ["CardProps + .map 渲染数据列表", "React / 基础 / 数据投放到网页上方法"],
-      ["React key：稳定唯一的列表身份标识", "React / 基础 / 数据投放到网页上方法"],
-      ["表单输入状态管理", "React / 基础"],
-      ["受控组件 value 与 onChange", "React / 基础 / 表单输入状态管理"],
-      ["表单提交 preventDefault", "React / 基础 / 表单输入状态管理"],
+      ["1.1 数据投放到网页上方法", "React / 01-数据投放到网页上方法 / 基础"],
+      ["1.2 CardProps + .map 渲染数据列表", "React / 01-数据投放到网页上方法 / 基础"],
+      ["1.3 React key：稳定唯一的列表身份标识", "React / 01-数据投放到网页上方法 / 基础"],
+      ["1.4 表单输入状态管理", "React / 02-表单输入状态管理 / 基础"],
+      ["1.5 受控组件 value 与 onChange", "React / 02-表单输入状态管理 / 基础"],
+      ["1.6 表单提交 preventDefault", "React / 02-表单输入状态管理 / 基础"],
     ]);
     expect(buildVaultWriteFiles(batch).map((file) => file.path)).toContain(
-      "React/基础/数据投放到网页上方法/CardProps + .map 渲染数据列表.md",
+      "React/01-数据投放到网页上方法/基础/1.2 CardProps + .map 渲染数据列表.md",
     );
     expect(buildVaultWriteFiles(batch).map((file) => file.path)).toContain(
-      "React/基础/表单输入状态管理/受控组件 value 与 onChange.md",
+      "React/02-表单输入状态管理/基础/1.5 受控组件 value 与 onChange.md",
     );
   });
 
@@ -1979,12 +1979,12 @@ describe("lifemind review core", () => {
     }, { vaultContext });
 
     expect(batch.notes.find((note) => note.id === "card-props-map")?.path).toBe(
-      "React / 基础 / 数据投放到网页上方法",
+      "React / 01-数据投放到网页上方法 / 基础",
     );
     expect(buildVaultMoveFiles(batch)).toEqual([
       {
         fromPath: "React/基础/React key：稳定唯一的列表身份标识.md",
-        toPath: "React/基础/数据投放到网页上方法/React key：稳定唯一的列表身份标识.md",
+        toPath: "React/01-数据投放到网页上方法/基础/React key：稳定唯一的列表身份标识.md",
         noteId: "group-existing-topic-react-key",
         title: "React key：稳定唯一的列表身份标识",
         reason: "既有笔记“React key：稳定唯一的列表身份标识”属于整合主题“数据投放到网页上方法”，确认后迁移到对应整合文件夹。",
@@ -1992,7 +1992,7 @@ describe("lifemind review core", () => {
     ]);
   });
 
-  it("does not turn short parent-child analysis into an integration folder", () => {
+  it("groups short parent-child analysis in a numbered folder without moving old notes", () => {
     const source: IntakeSource = {
       id: "src-react-short-list",
       title: "React 列表渲染简短补充",
@@ -2043,9 +2043,9 @@ describe("lifemind review core", () => {
       uncertain: [],
     }, { vaultContext });
 
-    expect(batch.notes.find((note) => note.id === "react-key-short")?.path).toBe("React / 基础");
+    expect(batch.notes.find((note) => note.id === "react-key-short")?.path).toBe("React / 01-数据投放到网页上方法 / 基础");
     expect(buildVaultWriteFiles(batch).map((file) => file.path)).toContain(
-      "React/基础/React key：稳定唯一的列表身份标识.md",
+      "React/01-数据投放到网页上方法/基础/1.2 React key：稳定唯一的列表身份标识.md",
     );
     expect(buildVaultMoveFiles(batch)).toEqual([]);
   });
@@ -2095,7 +2095,7 @@ describe("lifemind review core", () => {
     });
 
     expect(result.usedFallback).toBe(false);
-    expect(result.batch.notes[0].path).toBe("操作系统 / 进程与线程");
+    expect(result.batch.notes[0].path).toBe("操作系统 / 01-操作系统进程 / 进程与线程");
     expect(result.batch.notes[0].markdown).toContain("进程是操作系统进行资源分配的基本单位");
   });
 
@@ -2255,7 +2255,7 @@ describe("lifemind review core", () => {
 
     expect(batch.relations).toContainEqual({
       type: "前置知识",
-      source: "UART 串口",
+      source: "1.1 UART 串口",
       target: "GPIO 接口",
     });
     expect(batch.notes[0].markdown).toContain("前置知识：[[GPIO 接口]]");
@@ -2545,23 +2545,23 @@ git checkout -b feature/login`,
     );
 
     expect(batch.notes.map((note) => [note.title, note.grain, note.path])).toEqual([
-      ["Git 工具总览", "大颗粒度", "Git / Git 工具"],
-      ["Git 工具基本概念", "中颗粒度", "Git / Git 工具 / 基本概念"],
-      ["Git 工具应用步骤", "中颗粒度", "Git / Git 工具 / 应用步骤"],
-      ["Git 常用命令与代码", "小颗粒度", "Git / Git 工具 / 命令与代码"],
+      ["1.1 Git 工具总览", "大颗粒度", "Git / 01-Git 工具总览 / Git 工具"],
+      ["1.2 Git 工具基本概念", "中颗粒度", "Git / 01-Git 工具总览 / Git 工具 / 基本概念"],
+      ["1.3 Git 工具应用步骤", "中颗粒度", "Git / 01-Git 工具总览 / Git 工具 / 应用步骤"],
+      ["1.4 Git 常用命令与代码", "小颗粒度", "Git / 01-Git 工具总览 / Git 工具 / 命令与代码"],
     ]);
     expect(batch.notes[1].markdown).toContain("Pull Request");
     expect(batch.notes[2].markdown).toContain("创建团队仓库");
     expect(batch.notes[3].markdown).toContain("git checkout -b feature/login");
     expect(batch.relations).toContainEqual({
       type: "包含",
-      source: "Git 工具总览",
-      target: "Git 工具基本概念",
+      source: "1.1 Git 工具总览",
+      target: "1.2 Git 工具基本概念",
     });
     expect(batch.relations).toContainEqual({
       type: "递进",
-      source: "Git 工具基本概念",
-      target: "Git 工具应用步骤",
+      source: "1.2 Git 工具基本概念",
+      target: "1.3 Git 工具应用步骤",
     });
   });
 
@@ -3304,11 +3304,11 @@ git checkout -b feature/login`,
     expect(batch.relations).toEqual([]);
     expect(batch.uncertain).toEqual([]);
     expect(batch.notes[0]).toMatchObject({
-      title: "内存管理",
-      path: "操作系统",
+      title: "1.1 内存管理",
+      path: "操作系统 / 01-内存管理",
       status: "新建笔记",
     });
-    expect(noteVaultPath(batch.notes[0])).toBe("操作系统/内存管理.md");
+    expect(noteVaultPath(batch.notes[0])).toBe("操作系统/01-内存管理/1.1 内存管理.md");
     expect(batch.notes[0].markdown).toContain("```mermaid");
     expect(batch.notes[0].markdown).toContain(
       '<span class="lifemind-label" style="font-size: 1.08em; font-weight: 700;">单一连续分配：</span>内存分为系统区和用户区。',
@@ -3630,15 +3630,15 @@ git checkout -b feature/login`,
       },
     });
 
-    expect(batch.notes[0].path).toBe("TI嵌入式 / MSPM0G3507 / PWM");
-    expect(batch.relations).toContainEqual({ type: "包含", source: "PWM", target: "PWM 计数模式" });
+    expect(batch.notes[0].path).toBe("TI嵌入式 / 01-PWM 计数模式 / MSPM0G3507 / PWM");
+    expect(batch.relations).toContainEqual({ type: "包含", source: "PWM", target: "1.1 PWM 计数模式" });
     expect(batch.moves).toEqual([
       {
         fromPath: "TI嵌入式/MSPM0G3507/PWM.md",
-        toPath: "TI嵌入式/MSPM0G3507/PWM/PWM.md",
+        toPath: "TI嵌入式/01-PWM计数模式/MSPM0G3507/PWM/PWM.md",
         noteId: "promote-existing-topic-pwm",
         title: "PWM",
-        reason: "新笔记“PWM 计数模式”是既有主题“PWM”的下级分支，需把单篇旧笔记升级为主题文件夹。",
+        reason: "新笔记“1.1 PWM 计数模式”是既有主题“PWM”的下级分支，需把单篇旧笔记升级为主题文件夹。",
       },
     ]);
   });
@@ -3729,7 +3729,7 @@ git checkout -b feature/login`,
     );
 
     expect(buildVaultMoveFiles(result.batch)[0]?.fromPath).toBe("TI嵌入式/MSPM0G3507/PWM.md");
-    expect(buildVaultMoveFiles(result.batch)[0]?.toPath).toBe("TI嵌入式/MSPM0G3507/PWM/PWM.md");
+    expect(buildVaultMoveFiles(result.batch)[0]?.toPath).toBe("TI嵌入式/01-PWM模式/MSPM0G3507/PWM/PWM.md");
   });
 
   it("uses the second quality review pass as the final external model result", async () => {
@@ -3823,7 +3823,7 @@ git checkout -b feature/login`,
     });
 
     expect(reviewModes).toEqual(["draft-pass", "final-pass"]);
-    expect(result.batch.notes[0].title).toBe("Git 分支协作总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 分支协作总览");
     expect(result.message).toContain("二轮复审");
   });
 
@@ -3900,7 +3900,7 @@ git checkout -b feature/login`,
       },
     );
 
-    expect(result.batch.notes[0].path).toBe("嵌入式 / 系统时序 / 延时");
+    expect(result.batch.notes[0].path).toBe("嵌入式 / 01-系统延时 / 系统时序 / 延时");
     expect(result.batch.notes[0].markdown).toContain("前置知识：[[GPIO 接口]]");
   });
 
@@ -4171,7 +4171,7 @@ git checkout -b feature/login`,
     });
 
     expect(result.usedFallback).toBe(false);
-    expect(result.batch.notes[0].title).toBe("Git 工具总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 工具总览");
   });
 
   it("rejects a normal message.content response without a DeepSeek tool call", async () => {
@@ -4310,7 +4310,7 @@ git checkout -b feature/login`,
     });
 
     expect(requests).toHaveLength(2);
-    expect(result.batch.notes[0].title).toBe("Git 工具总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 工具总览");
   });
 
   it("builds a strict DeepSeek tool request for logic-link review", () => {
@@ -4402,7 +4402,7 @@ git checkout -b feature/login`,
 
     expect(attempts).toHaveLength(2);
     expect(result.usedFallback).toBe(false);
-    expect(result.batch.notes[0].title).toBe("Git 工具总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 工具总览");
   });
 
   it("includes request shape and source structure in diagnostic events", async () => {
@@ -4556,7 +4556,7 @@ git checkout -b feature/login`,
     expect(attempts).toBe(2);
     expect(result.usedFallback).toBe(false);
     expect(result.message).toContain("自动重试");
-    expect(result.batch.notes[0].title).toBe("Git 工具总览");
+    expect(result.batch.notes[0].title).toBe("1.1 Git 工具总览");
   });
 
   it("falls back to local review when model output fails validation", async () => {
@@ -4578,7 +4578,7 @@ git checkout -b feature/login`,
 
     expect(result.usedFallback).toBe(true);
     expect(result.provider).toBe("local");
-    expect(result.batch.notes[0].title).toBe("Java 控制台输出");
+    expect(result.batch.notes[0].title).toBe("1.1 Java 控制台输出");
   });
 
   it("keeps the selected vault context when external review falls back to local", async () => {
@@ -4706,7 +4706,7 @@ git checkout -b feature/login`,
     });
 
     expect(result.usedFallback).toBe(false);
-    expect(result.batch.notes[0].title).toBe("API 连接测试");
+    expect(result.batch.notes[0].title).toBe("1.1 API 连接测试");
   });
 
   it("keeps the shared request prefix stable across draft and final passes", () => {
