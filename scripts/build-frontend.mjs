@@ -1,11 +1,10 @@
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { build as buildFrontend } from "esbuild";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = path.join(projectRoot, "out");
-const esbuild = path.join(projectRoot, "node_modules", ".bin", "esbuild");
 const tempOutPrefix = path.join(projectRoot, ".out-build-");
 const staleBuildDirs = readdirSync(projectRoot, { withFileTypes: true })
   .filter((entry) => entry.isDirectory() && entry.name.startsWith(".out-build-"))
@@ -13,6 +12,9 @@ const staleBuildDirs = readdirSync(projectRoot, { withFileTypes: true })
 const tempOutDir = mkdtempSync(tempOutPrefix);
 const assetsDir = path.join(tempOutDir, "assets");
 const backupOutDir = `${outDir}.previous`;
+
+// Keep the packaging helper predictable on memory-constrained desktop builders.
+process.env.GOMAXPROCS ??= "1";
 
 for (const staleBuildDir of staleBuildDirs) {
   try {
@@ -24,34 +26,18 @@ for (const staleBuildDir of staleBuildDirs) {
 mkdirSync(assetsDir, { recursive: true });
 
 try {
-  const result = spawnSync(
-    esbuild,
-    [
-      path.join(projectRoot, "src", "main.tsx"),
-      "--bundle",
-      "--format=esm",
-      "--target=es2020",
-      `--outfile=${path.join(assetsDir, "index.js")}`,
-      "--loader:.tsx=tsx",
-      "--loader:.ts=ts",
-      "--loader:.css=css",
-      "--external:/fonts/*",
-      "--minify=false",
-    ],
-    {
-      cwd: projectRoot,
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        // 限制 esbuild 的并发，避免 macOS 在内存压力下直接终止打包进程。
-        GOMAXPROCS: process.env.GOMAXPROCS ?? "1",
-      },
-    },
-  );
-
-  if (result.status !== 0 || result.signal) {
-    throw new Error(`前端构建失败${result.signal ? `：${result.signal}` : ""}`);
-  }
+  await buildFrontend({
+    entryPoints: [path.join(projectRoot, "src", "main.tsx")],
+    bundle: true,
+    format: "esm",
+    target: "es2020",
+    outfile: path.join(assetsDir, "index.js"),
+    loader: { ".tsx": "tsx", ".ts": "ts", ".css": "css" },
+    external: ["/fonts/*"],
+    minify: false,
+    absWorkingDir: projectRoot,
+    logLevel: "info",
+  });
 
   cpSync(path.join(projectRoot, "public"), tempOutDir, { recursive: true, force: true });
   writeFileSync(

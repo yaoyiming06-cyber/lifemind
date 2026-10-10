@@ -544,8 +544,14 @@ fn scan_vault_knowledge(vault_root: String) -> Result<VaultKnowledgeContext, Str
 }
 
 #[tauri::command]
-fn discard_review_preview(preview_root: String) -> Result<(), String> {
+fn discard_review_preview(app: tauri::AppHandle, preview_root: String) -> Result<(), String> {
+    validate_app_preview_root(&app, &preview_root)?;
     discard_preview_root(&preview_root)
+}
+
+#[tauri::command]
+fn get_preview_root(app: tauri::AppHandle) -> Result<String, String> {
+    preview_root_for_app(&app).map(|path| path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -727,43 +733,14 @@ fn detect_intake_source_type(file_name: &str) -> &'static str {
     "text"
 }
 
-#[cfg(target_os = "macos")]
 fn select_files_with_native_dialog() -> Result<Vec<String>, String> {
-    let script = r#"
-set chosenFiles to choose file with prompt "选择 LifeMind 要审理的文件" with multiple selections allowed
-set output to ""
-repeat with chosenFile in chosenFiles
-  set output to output & POSIX path of chosenFile & linefeed
-end repeat
-return output
-"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("无法打开系统文件选择器：{error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if stderr.contains("User canceled") || stderr.contains("用户已取消") {
-            return Ok(Vec::new());
-        }
-
-        return Err(format!("系统文件选择器失败：{}", stderr.trim()));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
+    Ok(rfd::FileDialog::new()
+        .set_title("选择 LifeMind 要审理的文件")
+        .pick_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
         .collect())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn select_files_with_native_dialog() -> Result<Vec<String>, String> {
-    Err("当前版本的桌面文件选择器先支持 macOS。".to_string())
 }
 
 #[tauri::command]
@@ -801,13 +778,15 @@ fn open_obsidian_preview(
     }
 
     if let (Some(root), Some(files)) = (preview_root.as_deref(), files.as_deref()) {
-        write_preview_files(root, files)?;
+        validate_app_preview_root(&app, root)?;
+        write_preview_files(&app, root, files)?;
     }
 
     if let Some(root) = preview_root.as_deref() {
+        validate_app_preview_root(&app, root)?;
         let root_path = PathBuf::from(root);
         let preview_file = root_path.join(safe_relative_preview_path(file)?);
-        open_preview_root_in_obsidian(&root_path, &preview_file)?;
+        open_preview_root_in_obsidian(&root_path, &preview_file, vault, file)?;
     } else {
         let uri = format!(
             "obsidian://open?vault={}&file={}",
@@ -831,6 +810,26 @@ fn open_obsidian_preview(
 
         activate_lifemind_app();
     });
+
+    Ok(())
+}
+
+fn preview_root_for_app(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|directory| directory.join("lifemind-review-current-vault"))
+        .map_err(|error| format!("无法定位 LifeMind 本地预览目录：{error}"))
+}
+
+fn validate_app_preview_root(app: &tauri::AppHandle, root: &str) -> Result<(), String> {
+    let expected_parent = preview_root_for_app(app)?;
+    let root_path = Path::new(root.trim());
+
+    if root_path.parent() != Some(expected_parent.as_path())
+        || !is_lifemind_batch_preview_root(root_path)
+    {
+        return Err("临时预览目录必须位于 LifeMind 应用本地预览目录中。".to_string());
+    }
 
     Ok(())
 }
@@ -1177,6 +1176,12 @@ fn is_allowed_pdf_image_data_url(value: &str) -> bool {
             .all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
             })
+}
+
+#[cfg(any(not(target_os = "macos"), all(test, target_os = "macos")))]
+fn pdf_png_data_url(png: &[u8]) -> Option<String> {
+    let value = format!("data:image/png;base64,{}", BASE64_STANDARD.encode(png));
+    is_allowed_pdf_image_data_url(&value).then_some(value)
 }
 
 fn decode_image_data_url(value: &str) -> Result<Vec<u8>, String> {
@@ -1567,16 +1572,18 @@ fn validate_unique_batch_operation_paths(
         let to_relative = safe_relative_preview_path(&move_file.to_path)?;
         let from_path = path_to_string(&from_relative);
         let to_path = path_to_string(&to_relative);
+        let from_key = operation_path_key(&from_path);
+        let to_key = operation_path_key(&to_path);
 
-        if from_path == to_path {
+        if from_key == to_key {
             return Err(format!("迁移源路径和目标路径不能相同：{from_path}"));
         }
 
-        if !move_sources.insert(from_path.clone()) {
+        if !move_sources.insert(from_key) {
             return Err(format!("批次事务包含重复迁移源路径：{from_path}"));
         }
 
-        if !target_paths.insert(to_path.clone()) {
+        if !target_paths.insert(to_key) {
             return Err(format!("批次事务包含重复目标路径：{to_path}"));
         }
     }
@@ -1584,13 +1591,26 @@ fn validate_unique_batch_operation_paths(
     for file in files {
         let relative_path = safe_relative_preview_path(&file.path)?;
         let target_path = path_to_string(&relative_path);
+        let target_key = operation_path_key(&target_path);
 
-        if !target_paths.insert(target_path.clone()) {
+        if !target_paths.insert(target_key) {
             return Err(format!("批次事务包含重复目标路径：{target_path}"));
         }
     }
 
     Ok(())
+}
+
+fn operation_path_key(value: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return value.to_ascii_lowercase();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        value.to_string()
+    }
 }
 
 #[allow(dead_code)]
@@ -3276,10 +3296,64 @@ fn extract_pdf_page_rendering(
 
 #[cfg(not(target_os = "macos"))]
 fn extract_pdf_page_rendering(
-    _pdf_bytes: &[u8],
+    pdf_bytes: &[u8],
     _file_name: &str,
 ) -> Result<PdfRenderedDocument, String> {
-    Err("PDF 页面视觉渲染仅支持 macOS。".to_string())
+    render_pdf_pages_with_hayro(pdf_bytes)
+}
+
+#[cfg(any(not(target_os = "macos"), all(test, target_os = "macos")))]
+fn render_pdf_pages_with_hayro(pdf_bytes: &[u8]) -> Result<PdfRenderedDocument, String> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{render, RenderCache, RenderSettings};
+    use std::sync::Arc;
+
+    const MAX_RENDERED_PAGES: usize = 80;
+    const PAGE_SCALE: f32 = 1.5;
+    const MAX_PAGE_DIMENSION: u16 = 2400;
+
+    let pdf = Pdf::new(Arc::new(pdf_bytes.to_vec()))
+        .map_err(|error| format!("无法解析 PDF 页面：{error:?}"))?;
+    let interpreter_settings = InterpreterSettings::default();
+    let cache = RenderCache::new();
+    let mut pages = Vec::new();
+
+    for (index, page) in pdf.pages().iter().take(MAX_RENDERED_PAGES).enumerate() {
+        let (page_width, page_height) = page.render_dimensions();
+        let max_dimension = page_width.max(page_height).max(1.0);
+        let scale = PAGE_SCALE.min(f32::from(MAX_PAGE_DIMENSION) / max_dimension);
+        let width = (page_width * scale)
+            .round()
+            .clamp(1.0, f32::from(MAX_PAGE_DIMENSION)) as u16;
+        let height = (page_height * scale)
+            .round()
+            .clamp(1.0, f32::from(MAX_PAGE_DIMENSION)) as u16;
+        let render_settings = RenderSettings {
+            x_scale: scale,
+            y_scale: scale,
+            width: Some(width),
+            height: Some(height),
+            bg_color: WHITE,
+        };
+        let pixmap = render(page, &cache, &interpreter_settings, &render_settings);
+        let image_width = u32::from(pixmap.width());
+        let image_height = u32::from(pixmap.height());
+        let png = pixmap
+            .into_png()
+            .map_err(|error| format!("无法编码 PDF 第 {} 页 PNG：{error}", index + 1))?;
+        let image_data_url = pdf_png_data_url(&png);
+
+        pages.push(PdfRenderedPage {
+            page: index + 1,
+            image_width,
+            image_height,
+            image_data_url,
+        });
+    }
+
+    Ok(PdfRenderedDocument { pages })
 }
 
 #[cfg(target_os = "macos")]
@@ -4154,7 +4228,16 @@ fn write_manifest(path: &Path, manifest: &BatchManifest) -> Result<(), String> {
     fs::write(path, content).map_err(|error| format!("无法写入批次事务记录：{error}"))
 }
 
-fn write_preview_files(root: &str, files: &[PreviewFilePayload]) -> Result<(), String> {
+fn write_preview_files(
+    app: &tauri::AppHandle,
+    root: &str,
+    files: &[PreviewFilePayload],
+) -> Result<(), String> {
+    validate_app_preview_root(app, root)?;
+    write_preview_files_contents(root, files)
+}
+
+fn write_preview_files_contents(root: &str, files: &[PreviewFilePayload]) -> Result<(), String> {
     let root = root.trim();
 
     if root.is_empty() {
@@ -4204,6 +4287,8 @@ fn discard_preview_root(root: &str) -> Result<(), String> {
     if !is_lifemind_batch_preview_root(&root_path) {
         return Err("只能删除 LifeMind 创建的当前批次临时预览目录。".to_string());
     }
+
+    quit_obsidian_before_preview()?;
 
     if root_path.exists() {
         fs::remove_dir_all(&root_path).map_err(|error| {
@@ -4318,7 +4403,13 @@ fn safe_relative_preview_path(value: &str) -> Result<PathBuf, String> {
 
     for component in path.components() {
         match component {
-            Component::Normal(segment) => safe_path.push(segment),
+            Component::Normal(segment) => {
+                let segment = segment
+                    .to_str()
+                    .ok_or_else(|| "预览文件路径包含无法识别的文件名。".to_string())?;
+                validate_windows_safe_path_segment(segment)?;
+                safe_path.push(segment);
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err("预览文件路径不能离开临时 Vault。".to_string());
@@ -4331,6 +4422,36 @@ fn safe_relative_preview_path(value: &str) -> Result<PathBuf, String> {
     }
 
     Ok(safe_path)
+}
+
+fn validate_windows_safe_path_segment(segment: &str) -> Result<(), String> {
+    if segment.is_empty()
+        || segment.ends_with(' ')
+        || segment.ends_with('.')
+        || segment.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | '"' | ':' | '|' | '?' | '*')
+        })
+    {
+        return Err(format!("预览文件名不符合 Windows 文件系统规则：{segment}"));
+    }
+
+    let stem = segment
+        .split_once('.')
+        .map_or(segment, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || (stem.len() == 4
+            && matches!(
+                stem.as_bytes()[0..3],
+                [b'C', b'O', b'M'] | [b'L', b'P', b'T']
+            )
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+    {
+        return Err(format!("预览文件名是 Windows 保留设备名：{segment}"));
+    }
+
+    Ok(())
 }
 
 fn safe_batch_id(value: &str) -> Result<String, String> {
@@ -4574,59 +4695,94 @@ fn activate_lifemind_app() {
 fn activate_lifemind_app() {}
 
 #[cfg(target_os = "macos")]
-fn open_preview_root_in_obsidian(root_path: &Path, _preview_file: &Path) -> Result<(), String> {
-    register_lifemind_preview_vault(root_path)?;
+fn open_preview_root_in_obsidian(
+    root_path: &Path,
+    _preview_file: &Path,
+    _vault: &str,
+    _file: &str,
+) -> Result<(), String> {
     quit_obsidian_before_preview()?;
+    register_lifemind_preview_vault(root_path)?;
     open_macos_app_path("Obsidian", root_path)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn open_preview_root_in_obsidian(root_path: &Path, _preview_file: &Path) -> Result<(), String> {
+#[cfg(target_os = "windows")]
+fn open_preview_root_in_obsidian(
+    root_path: &Path,
+    _preview_file: &Path,
+    _vault: &str,
+    file: &str,
+) -> Result<(), String> {
+    quit_obsidian_before_preview()?;
+    let vault_id = register_lifemind_preview_vault(root_path)?;
+    let uri = format!(
+        "obsidian://open?vault={}&file={}",
+        percent_encode(&vault_id),
+        percent_encode(file)
+    );
+    open_uri(&uri)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn open_preview_root_in_obsidian(
+    root_path: &Path,
+    _preview_file: &Path,
+    _vault: &str,
+    _file: &str,
+) -> Result<(), String> {
     open_uri(&root_path.to_string_lossy())
 }
 
-#[cfg(target_os = "macos")]
-fn register_lifemind_preview_vault(root_path: &Path) -> Result<String, String> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Err("无法定位用户 HOME 目录，不能登记 Obsidian 临时预览 Vault。".to_string());
-    };
-    let registry_path = PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("obsidian")
-        .join("obsidian.json");
-
-    if !registry_path.exists() {
-        return Ok(stable_lifemind_preview_vault_id(root_path));
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn obsidian_registry_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("obsidian")
+                .join("obsidian.json")
+        });
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|app_data| app_data.join("obsidian").join("obsidian.json"));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn register_lifemind_preview_vault(root_path: &Path) -> Result<String, String> {
+    let registry_path = obsidian_registry_path()
+        .ok_or_else(|| "无法定位 Obsidian 用户配置目录，不能登记临时预览 Vault。".to_string())?;
+    if !registry_path.is_file() {
+        return Err(format!(
+            "未发现 Obsidian 配置文件 {}，请先启动并完成一次 Obsidian 初始化后再打开预览。",
+            registry_path.to_string_lossy()
+        ));
+    }
+    let id = stable_lifemind_preview_vault_id(root_path);
     let content = fs::read_to_string(&registry_path)
         .map_err(|error| format!("无法读取 Obsidian Vault 注册表：{error}"))?;
-    let id = stable_lifemind_preview_vault_id(root_path);
     let updated =
         upsert_obsidian_preview_vault_config(&content, root_path, unix_timestamp_millis())?;
     let backup_path = registry_path.with_file_name("obsidian.json.lifemind-backup");
-
     if !backup_path.exists() {
         let _ = fs::copy(&registry_path, &backup_path);
     }
-
-    fs::write(&registry_path, updated)
+    write_obsidian_registry_atomically(&registry_path, &updated)
         .map_err(|error| format!("无法登记 Obsidian 临时预览 Vault：{error}"))?;
-
     Ok(id)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn unregister_lifemind_preview_vault(root_path: &Path) -> Result<(), String> {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(registry_path) = obsidian_registry_path() else {
         return Ok(());
     };
-    let registry_path = PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("obsidian")
-        .join("obsidian.json");
 
     if !registry_path.exists() {
         return Ok(());
@@ -4635,14 +4791,106 @@ fn unregister_lifemind_preview_vault(root_path: &Path) -> Result<(), String> {
     let content = fs::read_to_string(&registry_path)
         .map_err(|error| format!("无法读取 Obsidian Vault 注册表：{error}"))?;
     let updated = remove_obsidian_preview_vault_config(&content, root_path)?;
-
-    fs::write(&registry_path, updated)
+    write_obsidian_registry_atomically(&registry_path, &updated)
         .map_err(|error| format!("无法移除 Obsidian 临时预览 Vault 登记：{error}"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn unregister_lifemind_preview_vault(_root_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+fn write_obsidian_registry_atomically(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Obsidian 配置文件缺少父目录。".to_string())?;
+    let temp_path = parent.join(format!(
+        ".{}.lifemind-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("obsidian.json"),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| format!("无法创建 Obsidian 配置临时文件：{error}"))?;
+    let result = (|| {
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("无法写入 Obsidian 配置临时文件：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("无法同步 Obsidian 配置临时文件：{error}"))?;
+        drop(file);
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            let from: Vec<u16> = temp_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let to: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let moved = unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved == 0 {
+                return Err(format!(
+                    "无法原子替换 Obsidian 配置文件：{}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        fs::rename(&temp_path, path)
+            .map_err(|error| format!("无法原子替换 Obsidian 配置文件：{error}"))?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn quit_obsidian_before_preview() -> Result<(), String> {
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Process Obsidian -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }",
+        ])
+        .status();
+
+    for _ in 0..30 {
+        let running = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Obsidian.exe", "/NH"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("Obsidian.exe"))
+            .unwrap_or(false);
+        if !running {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err("Obsidian 正在运行且无法正常关闭，请先关闭 Obsidian 后再打开预览。".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -4664,6 +4912,11 @@ fn quit_obsidian_before_preview() -> Result<(), String> {
     }
 
     Err("Obsidian 正在运行且暂时无法退出，请先关闭 Obsidian 后再打开预览。".to_string())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn quit_obsidian_before_preview() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -4801,15 +5054,35 @@ fn open_uri(uri: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_uri(uri: &str) -> Result<(), String> {
-    let status = Command::new("cmd")
-        .args(["/C", "start", "", uri])
-        .status()
-        .map_err(|error| format!("无法调用 Windows start 命令：{error}"))?;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
-    if status.success() {
+    let operation: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let target: Vec<u16> = std::ffi::OsStr::new(uri)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if (result as isize) > 32 {
         Ok(())
     } else {
-        Err(format!("打开 Obsidian URI 失败，退出码：{status}"))
+        Err(format!(
+            "打开 Obsidian URI 失败，Windows Shell 错误码：{}",
+            result as isize
+        ))
     }
 }
 
@@ -4851,6 +5124,7 @@ pub fn run() {
             list_review_batches,
             scan_vault_knowledge,
             discard_review_preview,
+            get_preview_root,
             extract_pdf_text,
             extract_pdf_text_from_path,
             extract_text_file_from_path,
@@ -4875,7 +5149,7 @@ mod tests {
             safe_relative_preview_path("20-生成预览/Java/Java基础语法/Java 控制台输出.md").unwrap();
 
         assert_eq!(
-            path.to_string_lossy(),
+            path_to_string(&path),
             "20-生成预览/Java/Java基础语法/Java 控制台输出.md"
         );
     }
@@ -4896,6 +5170,151 @@ mod tests {
     fn rejects_paths_that_escape_preview_root() {
         assert!(safe_relative_preview_path("../真实知识库.md").is_err());
         assert!(safe_relative_preview_path("/Users/a0000/真实知识库.md").is_err());
+    }
+
+    #[test]
+    fn hayro_renders_bounded_png_pages_with_correct_page_numbers() {
+        let bytes = render_fixture_pdf(&[(200, 100), (100, 200), (100_000, 100_000)]);
+        let rendered = render_pdf_pages_with_hayro(&bytes).unwrap();
+        assert_eq!(rendered.pages.len(), 3);
+        for (index, page) in rendered.pages.iter().enumerate() {
+            assert_eq!(page.page, index + 1);
+            assert!(page.image_width > 0 && page.image_width <= 2400);
+            assert!(page.image_height > 0 && page.image_height <= 2400);
+            let url = page.image_data_url.as_ref().unwrap();
+            assert!(is_allowed_pdf_image_data_url(url));
+            let png = BASE64_STANDARD
+                .decode(url.strip_prefix("data:image/png;base64,").unwrap())
+                .unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let decoder = png::Decoder::new(std::io::Cursor::new(png))
+                .read_info()
+                .unwrap();
+            assert_eq!(decoder.info().width, page.image_width);
+            assert_eq!(decoder.info().height, page.image_height);
+        }
+        assert_eq!(rendered.pages[0].image_width, 300);
+        assert_eq!(rendered.pages[0].image_height, 150);
+    }
+
+    #[test]
+    fn pdf_png_data_urls_fit_the_model_and_preview_size_limit() {
+        let largest_payload = (6_000_000 - "data:image/png;base64,".len()) / 4 * 3;
+        let bytes = vec![42; largest_payload];
+        let url = pdf_png_data_url(&bytes).unwrap();
+        assert!(is_allowed_pdf_image_data_url(&url));
+        assert_eq!(decode_image_data_url(&url).unwrap(), bytes);
+        assert!(pdf_png_data_url(&vec![42; largest_payload + 1]).is_none());
+    }
+
+    #[test]
+    fn hayro_rejects_invalid_pdf_and_caps_the_page_count() {
+        assert!(render_pdf_pages_with_hayro(b"not a PDF").is_err());
+        let bytes = render_fixture_pdf(&vec![(10, 10); 81]);
+        let rendered = render_pdf_pages_with_hayro(&bytes).unwrap();
+        assert_eq!(rendered.pages.len(), 80);
+        assert_eq!(rendered.pages.last().unwrap().page, 80);
+    }
+
+    #[test]
+    fn hayro_never_returns_an_image_rejected_by_the_model_size_limit() {
+        use lopdf::{dictionary, Document, Stream};
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let (width, height) = (1100_u32, 900_u32);
+        let mut seed = 17_u32;
+        let pixels = (0..width * height * 3)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => width, "Height" => height,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            pixels,
+        ));
+        let contents_id = document.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            format!("q {width} 0 0 {height} 0 0 cm /Image Do Q").into_bytes(),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_id } },
+            "Contents" => contents_id,
+        });
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages", "Count" => 1, "Kids" => vec![page_id.into()],
+            },
+        );
+        let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        document.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        let rendered = render_pdf_pages_with_hayro(&bytes).unwrap();
+        if let Some(url) = &rendered.pages[0].image_data_url {
+            assert!(
+                is_allowed_pdf_image_data_url(url),
+                "encoded page was {} bytes",
+                url.len()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_windows_device_names_and_ambiguous_filename_suffixes() {
+        for path in [
+            "CON.md",
+            "notes/nul.png",
+            "aux.txt",
+            "COM1.md",
+            "LPT9.log",
+            "notes/file.",
+            "notes/dir /file.md",
+            "notes/file:stream.md",
+        ] {
+            assert!(safe_relative_preview_path(path).is_err(), "accepted {path}");
+        }
+    }
+
+    fn render_fixture_pdf(dimensions: &[(i64, i64)]) -> Vec<u8> {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let contents = document.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"1 0 0 rg 0 0 10 10 re f".to_vec(),
+        ));
+        let kids: Vec<Object> =
+            dimensions
+                .iter()
+                .map(|(width, height)| {
+                    document.add_object(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), (*width).into(), (*height).into()],
+                "Resources" => lopdf::Dictionary::new(), "Contents" => contents,
+            }).into()
+                })
+                .collect();
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages", "Count" => dimensions.len() as i64, "Kids" => kids,
+            },
+        );
+        let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        document.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
     }
 
     #[test]
@@ -5378,7 +5797,7 @@ mod tests {
         let root_string = root.to_string_lossy().to_string();
         let _ = fs::remove_dir_all(&root);
 
-        write_preview_files(
+        write_preview_files_contents(
             &root_string,
             &[PreviewFilePayload {
                 path: "00-审理确认总览.md".to_string(),
@@ -5408,7 +5827,7 @@ mod tests {
         fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
         fs::write(&stale_file, "old").unwrap();
 
-        write_preview_files(
+        write_preview_files_contents(
             &root_string,
             &[PreviewFilePayload {
                 path: "00-审理确认总览.md".to_string(),

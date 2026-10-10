@@ -108,9 +108,29 @@ type VaultCheckState = "idle" | "checking" | "checked" | "failed";
 
 const previewVault = {
   name: "lifemindreview01",
-  root: "/Users/a0000/Documents/obsidian项目/lifemind-review-current-vault",
   indexFile: "00-审理确认总览.md",
 };
+
+function createPreviewRootResolver() {
+  let pending: Promise<string> | null = null;
+
+  return () => {
+    if (!isDesktopApp()) {
+      return Promise.resolve("");
+    }
+
+    if (!pending) {
+      pending = invoke<string>("get_preview_root").catch((error) => {
+        pending = null;
+        throw error;
+      });
+    }
+
+    return pending;
+  };
+}
+
+const resolvePreviewRoot = createPreviewRootResolver();
 
 const vaultPathStorageKey = "lifemind.vaultPath";
 const reviewProviderStorageKey = "lifemind.reviewProvider";
@@ -226,6 +246,7 @@ export default function Home() {
   const [batchStatus, setBatchStatus] = useState<BatchStatus>("draft");
   const [previewState, setPreviewState] = useState<PreviewState>("idle");
   const [previewError, setPreviewError] = useState("");
+  const [previewRoot, setPreviewRoot] = useState("");
   const [pasteDraft, setPasteDraft] = useState("");
   const [webUrlDraft, setWebUrlDraft] = useState("");
   const [pendingFileItems, setPendingFileItems] = useState<PendingFileItem[]>([]);
@@ -292,7 +313,8 @@ export default function Home() {
   const pendingInputCount = pendingTextCount + pendingFileItems.length;
   const vaultWriteFiles = reviewBatch ? buildVaultWriteFiles(reviewBatch) : [];
   const vaultMoveFiles = reviewBatch ? buildVaultMoveFiles(reviewBatch) : [];
-  const currentPreviewRoot = reviewBatch ? buildBatchPreviewRoot(previewVault.root, reviewBatch.id) : previewVault.root;
+  const batchPreviewRoot = reviewBatch && previewRoot ? buildBatchPreviewRoot(previewRoot, reviewBatch.id) : previewRoot;
+  const currentPreviewRoot = batchPreviewRoot;
   const firstNote = batchNotes[0];
   const firstPathSegments = firstNote?.path.split("/").map((segment) => segment.trim()) ?? [];
   const logicLinkSuggestionCount = logicLinkDraft?.suggestions.length ?? 0;
@@ -423,6 +445,29 @@ export default function Home() {
       cancelled = true;
     };
   }, [reviewProvider]);
+
+  useEffect(() => {
+    if (!isDesktopApp()) {
+      return;
+    }
+
+    let cancelled = false;
+    void resolvePreviewRoot()
+      .then((root) => {
+        if (!cancelled) {
+          setPreviewRoot(root);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setPreviewError(error instanceof Error ? error.message : String(error));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isDesktopApp()) {
@@ -1028,7 +1073,7 @@ export default function Home() {
         files: vaultWriteFiles,
         moves: vaultMoveFiles,
       });
-      const confirmedPreviewRoot = buildBatchPreviewRoot(previewVault.root, reviewBatch.id);
+      const confirmedPreviewRoot = buildBatchPreviewRoot(previewRoot, reviewBatch.id);
       let cleanupMessage = "临时预览已清理";
 
       if (isDesktopApp()) {
@@ -1062,7 +1107,7 @@ export default function Home() {
 
     if (batchStatus !== "confirmed") {
       const removedBatchId = reviewBatch.id;
-      const removedPreviewRoot = buildBatchPreviewRoot(previewVault.root, reviewBatch.id);
+      const removedPreviewRoot = buildBatchPreviewRoot(previewRoot, reviewBatch.id);
 
       previewRequestRef.current += 1;
       setBatchStatus("draft");
@@ -1277,7 +1322,7 @@ export default function Home() {
     if (isDesktopApp()) {
       try {
         await invoke("discard_review_preview", {
-          previewRoot: buildBatchPreviewRoot(previewVault.root, draftId),
+          previewRoot: buildBatchPreviewRoot(previewRoot, draftId),
         });
       } catch (error) {
         cleanupWarning = ` 旧预览清理失败：${error instanceof Error ? error.message : String(error)}`;
@@ -1343,14 +1388,21 @@ export default function Home() {
       return;
     }
 
+    if (logicLinkPreviewState === "opening" || previewState === "opening") {
+      return;
+    }
+
     setLogicLinkPreviewState("opening");
     setLogicLinkMessage("正在打开本次逻辑连接更新的独立 Obsidian 预览...");
 
     try {
+      if (isDesktopApp() && !previewRoot.trim()) {
+        throw new Error("正在准备桌面预览目录，请稍后重试。");
+      }
       await invoke("open_obsidian_preview", {
         vault: previewVault.name,
         file: "00-逻辑连接更新总览.md",
-        previewRoot: buildBatchPreviewRoot(previewVault.root, logicLinkDraft.id),
+        previewRoot: buildBatchPreviewRoot(previewRoot, logicLinkDraft.id),
         files: buildLogicLinkPreviewFiles(logicLinkDraft),
       });
       setLogicLinkPreviewState("opened");
@@ -1395,7 +1447,7 @@ export default function Home() {
         batchId: logicLinkDraft.id,
         links: buildLogicLinkPayload(logicLinkDraft),
       });
-      const confirmedPreviewRoot = buildBatchPreviewRoot(previewVault.root, logicLinkDraft.id);
+      const confirmedPreviewRoot = buildBatchPreviewRoot(previewRoot, logicLinkDraft.id);
       let cleanupMessage = "临时预览已删除";
 
       try {
@@ -1428,7 +1480,7 @@ export default function Home() {
 
     if (draftId && isDesktopApp()) {
       await invoke("discard_review_preview", {
-        previewRoot: buildBatchPreviewRoot(previewVault.root, draftId),
+        previewRoot: buildBatchPreviewRoot(previewRoot, draftId),
       }).catch((error) => {
         setLogicLinkMessage(`已放弃草稿 ${draftId}，但临时预览删除失败：${error instanceof Error ? error.message : String(error)}`);
       });
@@ -1442,6 +1494,10 @@ export default function Home() {
       return;
     }
 
+    if (previewState === "opening" || logicLinkPreviewState === "opening") {
+      return;
+    }
+
     const previewRequestId = previewRequestRef.current + 1;
     previewRequestRef.current = previewRequestId;
     setActiveNav("审理");
@@ -1450,13 +1506,16 @@ export default function Home() {
     setPreviewError("");
 
     try {
+      if (isDesktopApp() && !previewRoot.trim()) {
+        throw new Error("正在准备桌面预览目录，请稍后重试。");
+      }
       const activePreviewFiles = previewFiles.length > 0 ? previewFiles : buildPreviewFiles(reviewBatch);
 
       if (isDesktopApp()) {
         await invoke("open_obsidian_preview", {
           vault: previewVault.name,
           file: previewVault.indexFile,
-          previewRoot: buildBatchPreviewRoot(previewVault.root, reviewBatch.id),
+          previewRoot: batchPreviewRoot,
           files: [
             ...activePreviewFiles
               .filter((previewFile) => !previewFile.path.startsWith("附件/PDF页面/"))
@@ -1705,7 +1764,12 @@ export default function Home() {
                   <button
                     type="button"
                     className="preview-open-button"
-                    disabled={previewState === "opening" || batchStatus !== "draft" || !reviewBatch}
+                    disabled={
+                      previewState === "opening" ||
+                      logicLinkPreviewState === "opening" ||
+                      batchStatus !== "draft" ||
+                      !reviewBatch
+                    }
                     onClick={openPreviewInObsidian}
                   >
                     <ExternalLink size={15} />
@@ -1949,7 +2013,12 @@ export default function Home() {
                   <button
                     type="button"
                     className="preview-inline-action"
-                    disabled={previewState === "opening" || batchStatus !== "draft" || !reviewBatch}
+                    disabled={
+                      previewState === "opening" ||
+                      logicLinkPreviewState === "opening" ||
+                      batchStatus !== "draft" ||
+                      !reviewBatch
+                    }
                     onClick={openPreviewInObsidian}
                   >
                     <ExternalLink size={15} />
@@ -2028,6 +2097,7 @@ export default function Home() {
                 runState={logicLinkRunState}
                 message={logicLinkMessage}
                 previewState={logicLinkPreviewState}
+                otherPreviewState={previewState}
                 onRangePresetChange={handleLogicLinkRangePresetChange}
                 onGenerate={() => void generateLogicLinkDraft()}
                 onOpenPreview={() => void openLogicLinkPreviewInObsidian()}
@@ -2612,6 +2682,7 @@ function LogicLinkUpdateWorkspace({
   runState,
   message,
   previewState,
+  otherPreviewState,
   onRangePresetChange,
   onGenerate,
   onOpenPreview,
@@ -2623,13 +2694,19 @@ function LogicLinkUpdateWorkspace({
   runState: LogicLinkRunState;
   message: string;
   previewState: PreviewState;
+  otherPreviewState: PreviewState;
   onRangePresetChange: (value: LogicLinkRangePreset) => void;
   onGenerate: () => void;
   onOpenPreview: () => void;
   onConfirm: () => void;
   onDiscard: () => void;
 }) {
-  const isBusy = runState === "scanning" || runState === "reviewing" || runState === "confirming";
+  const isBusy =
+    runState === "scanning" ||
+    runState === "reviewing" ||
+    runState === "confirming" ||
+    previewState === "opening" ||
+    otherPreviewState === "opening";
   const suggestions = draft?.suggestions ?? [];
 
   return (
@@ -2848,7 +2925,7 @@ function SettingsWorkspace({
           <input
             value={vaultPath}
             onChange={(event) => onVaultPathChange(event.target.value)}
-            placeholder="/Users/你的用户名/Documents/ObsidianVault"
+            placeholder="例如：C:\\Users\\你的用户名\\Documents\\ObsidianVault"
             aria-label="真实 Obsidian Vault 路径"
           />
         </div>

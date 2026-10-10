@@ -8,6 +8,7 @@ const tsconfig = fs.readFileSync("tsconfig.json", "utf8");
 const tauri = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
 const rust = fs.readFileSync("src-tauri/src/lib.rs", "utf8");
 const cargoToml = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+const frontendBuild = fs.readFileSync("scripts/build-frontend.mjs", "utf8");
 const core = fs.readFileSync("src/lib/lifemind-core.ts", "utf8");
 const reviewSkill = fs.readFileSync("src/lib/lifemind-review-skill.ts", "utf8");
 const runner = fs.readFileSync("src/lib/lifemind-review-runner.ts", "utf8");
@@ -60,6 +61,14 @@ assert(page.includes("getCurrentWebview"), "desktop file drops should listen to 
 assert(page.includes('"extract_pdf_text_from_path"'), "desktop PDF intake should send file paths to Rust instead of huge JS byte arrays");
 assert(page.includes('"extract_text_file_from_path"'), "desktop text/code intake should read dropped paths in Rust too");
 assert(page.includes('"select_intake_file_paths"'), "desktop file selection should use a native path picker instead of browser File objects for PDFs");
+assert(page.includes('"get_preview_root"'), "desktop previews should resolve their root from the Tauri app data directory");
+assert(frontendBuild.includes('from "esbuild"') && frontendBuild.includes("buildFrontend"), "frontend builds should use the cross-platform esbuild API");
+assert(page.includes("createPreviewRootResolver"), "preview root loading should share pending requests and retry after errors");
+assert(page.includes('previewState === "opening"') && page.includes('logicLinkPreviewState === "opening"'), "both preview flows should block concurrent transactions");
+assert(!page.includes('/Users/a0000/Documents/obsidian项目/lifemind-review-current-vault'), "preview roots must not contain a developer machine path");
+assert(cargoToml.includes('rfd = { version = "0.17", default-features = false }'), "desktop file selection should use the cross-platform rfd dialog");
+assert(cargoToml.includes('features = ["apple-native", "windows-native"]'), "API keys should use native credential stores on macOS and Windows");
+assert(cargoToml.includes('hayro = "0.6"'), "PDF page rendering should have a cross-platform Rust fallback");
 assert(!page.includes("Array.from(new Uint8Array(await file.arrayBuffer()))"), "PDF intake must not freeze the WebView by expanding bytes on the JS main thread");
 assert(page.includes('"extract_webpage_text"'), "web URL intake should call the Tauri webpage extraction command");
 assert(page.includes("buildVaultWriteFiles"), "confirmed batches should use final vault write files");
@@ -125,7 +134,7 @@ assert(!page.includes("const generatedNotes = ["), "review results must not depe
 assert(page.includes("Obsidian 预览已打开"), "review preview tab should show Obsidian preview status");
 assert(page.includes("openPreviewInObsidian"), "review page should expose an app-owned Obsidian preview action");
 assert(page.includes('invoke("open_obsidian_preview"'), "preview action should call the Tauri desktop command");
-assert(page.includes("previewRoot: buildBatchPreviewRoot(previewVault.root, reviewBatch.id)"), "preview action should open the current batch folder, not the shared preview parent");
+assert(page.includes("previewRoot: batchPreviewRoot"), "preview action should open the resolved current batch folder");
 assert(page.includes("由 LifeMind 桌面脚本写入并打开"), "preview page should clarify Obsidian was opened by LifeMind");
 assert(page.includes("预览确认上下文"), "preview page should keep confirmation context visible after returning to lifemind");
 assert(page.includes("上传原文"), "preview confirmation context should include uploaded source text");
@@ -183,6 +192,7 @@ assert(
   "frontend build should use the stable esbuild packaging script for desktop packages",
 );
 assert(fs.existsSync("scripts/build-frontend.mjs"), "desktop packaging should have a deterministic frontend build script");
+assert(frontendBuild.includes('from "esbuild"'), "frontend packaging should use the cross-platform esbuild API on Windows");
 assert(pkg.scripts.dev === "vite --configLoader native --host 127.0.0.1 --port 3000", "desktop dev server should use the native Vite config loader");
 assert(fs.existsSync("index.html"), "Vite build should have a static HTML entry at the project root");
 assert(fs.existsSync("src/main.tsx"), "Vite build should mount the LifeMind React app through src/main.tsx");
@@ -273,6 +283,7 @@ assert(rust.includes("discard_review_preview"), "Tauri should define a preview d
 assert(rust.includes("extract_pdf_text"), "Tauri should define a PDF extraction command");
 assert(rust.includes("extract_pdf_text_from_path"), "Tauri should define a path-based PDF extraction command");
 assert(rust.includes("extract_pdf_text_layer"), "PDF text-layer extraction should be isolated behind a bounded helper");
+assert(rust.includes("render_pdf_pages_with_hayro"), "non-macOS PDF page rendering should use the Rust fallback");
 assert(
   rust.includes("PDF_TEXT_SWIFT_SCRIPT") && rust.includes('Duration::from_secs(30), "PDF 文本层抽取"'),
   "PDF text-layer extraction should run in a timeout-protected subprocess before OCR",
@@ -288,11 +299,14 @@ assert(rust.includes("save_model_api_key"), "Tauri should define a keychain save
 assert(rust.includes("load_model_api_key"), "Tauri should define a keychain load command");
 assert(rust.includes("open_preview_root_in_obsidian"), "Tauri preview command should open the current batch preview folder");
 assert(rust.includes("register_lifemind_preview_vault"), "preview folder should be registered as a temporary Obsidian vault before opening");
+assert(rust.includes("app_local_data_dir"), "preview root should live in the platform app-local data directory");
+assert(rust.includes("临时预览目录必须位于 LifeMind 应用本地预览目录中"), "preview writes should reject relative or unrelated roots");
+assert(rust.includes("obsidian://open?vault={}&file={}"), "Windows preview should open the registered temporary vault and file through Obsidian URI");
+assert(rust.includes('target_os = "windows"') && rust.includes("register_lifemind_preview_vault(root_path)?"), "Windows preview should register its temporary vault before opening Obsidian");
 assert(rust.includes("quit_obsidian_before_preview"), "preview should gracefully restart Obsidian so an already-open process does not keep stale vault state");
 assert(rust.includes("open_macos_app_path(\"Obsidian\", root_path)"), "preview should open the current batch folder directly after Obsidian exits");
 assert(!rust.includes(".arg(preview_file)"), "preview should not ask Obsidian to open a specific file before the temporary vault is ready");
 assert(!rust.includes("build_obsidian_open_path_uri"), "preview folders should not use obsidian://open?path because it still produces Vault not found popups");
-assert(!rust.includes("obsidian://open?path"), "preview folders should not use Obsidian path URLs");
 assert(rust.includes("set_focus"), "Tauri preview command should return focus to lifemind after opening Obsidian");
 
 if (!process.exitCode) {
